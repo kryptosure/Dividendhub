@@ -1,0 +1,1 @@
+postgresql://dividendhub_user:5cdXK5Q9eopPDGcIGPZ60auHlLiibSQB@dpg-dacfrtbm8hqs73aqhvqg-a/dividendhub
