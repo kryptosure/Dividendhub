@@ -1,4 +1,4 @@
-const Stock = require('../models/Stock');
+const Stock = require('../models/stock');
 const redis = require('../config/redis');
 const { fetchDividendData } = require('./yahooFinance');
 const { sleep } = require('../utils/helpers');

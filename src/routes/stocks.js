@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const rateLimit = require('express-rate-limit');
 const { Op } = require('sequelize');
-const Stock = require('../models/Stock');
+const Stock = require('../models/stock');
 const { getStock, getBatchStocks } = require('../services/stockService');
 const { yahooSearch } = require('../services/yahooFinance');
 
