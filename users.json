@@ -1,0 +1,27 @@
+{
+  "kryptosure@gmail.com": {
+    "email": "kryptosure@gmail.com",
+    "password": "$2b$10$opSyVJd/DdWyweCdTMez/eeDaMaBa.nK0eu2k5zq/FQDQ4ZBGz1dO",
+    "country": "Singapore",
+    "portfolio": [
+      {
+        "symbol": "AAPL",
+        "name": "Apple Inc.",
+        "shares": 100,
+        "market": "us"
+      },
+      {
+        "symbol": "MSFT",
+        "name": "Microsoft Corporation",
+        "shares": 100,
+        "market": "us"
+      },
+      {
+        "symbol": "JPM",
+        "name": "JPMorgan Chase & Co.",
+        "shares": 100,
+        "market": "us"
+      }
+    ]
+  }
+}
