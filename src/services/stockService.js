@@ -1,21 +1,12 @@
 const Stock = require('../models/stock');
-const redis = require('../config/redis');
 const { fetchDividendData } = require('./yahooFinance');
 const { sleep } = require('../utils/helpers');
 
-const CACHE_TTL = 300;
-
 async function getStock(symbol, market, type = 'stock') {
-  const cacheKey = `stock:${symbol}`;
-  try {
-    const cached = await redis.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-  } catch (e) { /* Redis not available */ }
-
   let stock = await Stock.findByPk(symbol);
   if (stock && Date.now() - new Date(stock.lastUpdated).getTime() < 12 * 60 * 60 * 1000) {
     const data = stock.dividendData;
-    const result = {
+    return {
       symbol: stock.symbol,
       name: stock.name,
       market: stock.market,
@@ -35,19 +26,16 @@ async function getStock(symbol, market, type = 'stock') {
       safetyScore: stock.safetyScore,
       exchange: data.exchange || (market === 'sg' ? 'SGX' : 'NASDAQ'),
     };
-    try { await redis.setEx(cacheKey, CACHE_TTL, JSON.stringify(result)); } catch (e) {}
-    return result;
   }
 
   const data = await fetchDividendData(symbol, market);
   if (data.error || data.message) throw new Error(data.error || data.message);
 
-  // Ensure market and type are explicitly set
   await Stock.upsert({
     symbol: data.symbol,
     name: data.name,
-    market: market,        // <-- use passed market, not data.market
-    type: type,            // <-- use passed type
+    market: market,
+    type: type,
     dividendData: data,
     currentPrice: data.currentPrice,
     currentYield: data.currentYield,
@@ -58,8 +46,6 @@ async function getStock(symbol, market, type = 'stock') {
     lastExDate: data.lastExDate,
     lastUpdated: new Date(),
   });
-
-  try { await redis.setEx(cacheKey, CACHE_TTL, JSON.stringify(data)); } catch (e) {}
 
   return data;
 }
@@ -87,10 +73,9 @@ async function refreshTopStocks(market = 'us') {
     ? ['SPY','QQQ','VTI','VOO','IVV','BND','AGG','GLD','SLV','EEM','EFA','IWM','XLK','XLF','XLE','XLI','XLV','XLY','XLP','XLU']
     : ['ES3.SI','G3B.SI','CFA.SI','O87.SI','M62.SI','N6M.SI','S27.SI','ER7.SI','NS8U.SI','GRN.SI'];
 
-  // First, delete existing stocks for this market to avoid duplicates
+  // Delete existing entries for this market to avoid duplicates
   await Stock.destroy({ where: { market } });
 
-  // Process stocks
   for (const symbol of stockSymbols) {
     try {
       await getStock(symbol, market, 'stock');
@@ -100,7 +85,6 @@ async function refreshTopStocks(market = 'us') {
     }
   }
 
-  // Process ETFs
   for (const symbol of etfSymbols) {
     try {
       await getStock(symbol, market, 'etf');
