@@ -14,16 +14,11 @@ app.use(cors());
 app.use(compression());
 app.use(express.json());
 
-// ✅ Serve static files from the 'public' folder (sitemap.xml, etc.)
-// __dirname is 'backend/src', so go up one level to 'backend/public'
+// Serve static files from the 'public' folder (sitemap.xml, etc.)
 app.use(express.static(path.join(__dirname, '../public')));
 
-// Routes
-app.use('/api/stocks/list', require('./routes/stocksList'));
-app.use('/api/stocks/list', (req, res, next) => {
-  console.log('📥 /api/stocks/list was called');
-  next();
-}, require('./routes/stocksList'));
+// Routes – note the new /api/stocks-list path
+app.use('/api/stocks-list', require('./routes/stocksList'));
 app.use('/api/stocks', require('./routes/stocks'));
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/portfolio', require('./routes/portfolio'));
