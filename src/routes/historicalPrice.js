@@ -2,8 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const router = express.Router();
 
-// Replace with your Alpha Vantage API key
-const ALPHA_VANTAGE_API_KEY = process.env.ALPHA_VANTAGE_API_KEY;
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
 router.get('/', async (req, res) => {
   const { symbol, date } = req.query;
@@ -12,61 +11,61 @@ router.get('/', async (req, res) => {
   }
 
   try {
-    // Fetch daily adjusted data from Alpha Vantage
-    const response = await axios.get('https://www.alphavantage.co/query', {
+    // Use Twelve Data's time_series endpoint
+    const targetDate = new Date(date);
+    const startDate = new Date(targetDate);
+    startDate.setDate(startDate.getDate() - 5); // 5 days before
+    const endDate = new Date(targetDate);
+    endDate.setDate(endDate.getDate() + 5); // 5 days after
+
+    const response = await axios.get('https://api.twelvedata.com/time_series', {
       params: {
-        function: 'TIME_SERIES_DAILY_ADJUSTED',
         symbol: symbol,
-        apikey: ALPHA_VANTAGE_API_KEY,
-        outputsize: 'compact',
+        interval: '1day',
+        outputsize: 30,
+        apikey: TWELVE_DATA_API_KEY,
+        start_date: startDate.toISOString().split('T')[0],
+        end_date: endDate.toISOString().split('T')[0],
       },
     });
 
-    const timeSeries = response.data['Time Series (Daily)'];
-    if (!timeSeries) {
-      return res.status(404).json({ error: 'No data found for this symbol' });
+    // Check for errors
+    if (response.data.status === 'error') {
+      console.error('Twelve Data error:', response.data.message);
+      return res.status(400).json({ error: response.data.message });
+    }
+
+    const values = response.data.values || [];
+    if (values.length === 0) {
+      return res.status(404).json({ error: 'No data found for this symbol and date' });
     }
 
     // Find the closest date to the requested date
-    const targetDate = new Date(date);
-    const targetDateStr = targetDate.toISOString().split('T')[0];
-    
-    // If the exact date exists, use it
-    if (timeSeries[targetDateStr]) {
-      const price = parseFloat(timeSeries[targetDateStr]['5. adjusted close']);
-      return res.json({
-        symbol,
-        date: targetDateStr,
-        price: price,
-        currency: 'USD',
-      });
-    }
-
-    // Otherwise, find the closest available date
-    const availableDates = Object.keys(timeSeries).sort();
-    let closestDate = null;
+    const targetDateMs = targetDate.getTime();
+    let closest = null;
     let closestDiff = Infinity;
 
-    for (const d of availableDates) {
-      const diff = Math.abs(new Date(d).getTime() - targetDate.getTime());
+    for (const entry of values) {
+      const entryDate = new Date(entry.datetime).getTime();
+      const diff = Math.abs(entryDate - targetDateMs);
       if (diff < closestDiff) {
         closestDiff = diff;
-        closestDate = d;
+        closest = entry;
       }
     }
 
-    if (closestDate && closestDiff < 30 * 24 * 60 * 60 * 1000) { // within 30 days
-      const price = parseFloat(timeSeries[closestDate]['5. adjusted close']);
+    if (closest && closestDiff < 5 * 24 * 60 * 60 * 1000) {
+      const price = parseFloat(closest.close);
       return res.json({
         symbol,
-        date: closestDate,
+        date: closest.datetime,
         price: price,
         currency: 'USD',
-        note: `Using closest available date: ${closestDate}`,
+        source: 'Twelve Data',
       });
     }
 
-    res.status(404).json({ error: 'No price found within 30 days of the specified date' });
+    res.status(404).json({ error: 'No price found within 5 days of the specified date' });
   } catch (error) {
     console.error('Historical price error:', error.message);
     res.status(500).json({ error: 'Failed to fetch historical price' });
