@@ -1,5 +1,5 @@
 const express = require('express');
-const Stock = require('../models/Stock');   // <- capital S
+const Stock = require('../models/stock');   // ← lowercase 's'
 const router = express.Router();
 
 router.get('/', async (req, res) => {
