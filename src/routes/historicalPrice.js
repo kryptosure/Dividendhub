@@ -11,11 +11,9 @@ router.get('/', async (req, res) => {
   }
 
   try {
-    // Parse the date
+    // Try to get historical data (may fail on free tier)
     const targetDate = new Date(date);
-    // Finnhub expects a timestamp (UNIX seconds) for the 'to' parameter
     const toTimestamp = Math.floor(targetDate.getTime() / 1000);
-    // Fetch 30 days before the target date
     const fromDate = new Date(targetDate);
     fromDate.setDate(fromDate.getDate() - 30);
     const fromTimestamp = Math.floor(fromDate.getTime() / 1000);
@@ -23,7 +21,7 @@ router.get('/', async (req, res) => {
     const response = await axios.get('https://finnhub.io/api/v1/stock/candle', {
       params: {
         symbol: symbol,
-        resolution: 'D', // Daily
+        resolution: 'D',
         from: fromTimestamp,
         to: toTimestamp,
         token: FINNHUB_API_KEY,
@@ -31,53 +29,60 @@ router.get('/', async (req, res) => {
     });
 
     const data = response.data;
-    if (data.s === 'no_data') {
-      return res.status(404).json({ error: 'No data found for this symbol and date' });
-    }
 
-    // Finnhub returns arrays: c = close, t = timestamp
-    const prices = data.c || [];
-    const timestamps = data.t || [];
+    // If we get a valid response with prices, use it
+    if (data.s !== 'no_data' && data.c && data.c.length > 0) {
+      // ... (find the closest price logic)
+      const prices = data.c;
+      const timestamps = data.t;
+      const targetDateMs = targetDate.getTime();
+      let closestIndex = 0;
+      let closestDiff = Infinity;
 
-    if (prices.length === 0) {
-      return res.status(404).json({ error: 'No price data available' });
-    }
-
-    // Find the closest date to the requested date
-    const targetDateMs = targetDate.getTime();
-    let closestIndex = 0;
-    let closestDiff = Infinity;
-
-    for (let i = 0; i < timestamps.length; i++) {
-      const diff = Math.abs(timestamps[i] * 1000 - targetDateMs);
-      if (diff < closestDiff) {
-        closestDiff = diff;
-        closestIndex = i;
+      for (let i = 0; i < timestamps.length; i++) {
+        const diff = Math.abs(timestamps[i] * 1000 - targetDateMs);
+        if (diff < closestDiff) {
+          closestDiff = diff;
+          closestIndex = i;
+        }
       }
+
+      const closestDate = new Date(timestamps[closestIndex] * 1000);
+      return res.json({
+        symbol,
+        requestedDate: date,
+        date: closestDate.toISOString().split('T')[0],
+        price: prices[closestIndex],
+        currency: 'USD',
+        source: 'Finnhub',
+      });
     }
 
-    // If the closest date is more than 7 days away, return a note
-    const closestDate = new Date(timestamps[closestIndex] * 1000);
-    const diffDays = Math.abs((closestDate - targetDate) / (1000 * 60 * 60 * 24));
-    let note = '';
-    if (diffDays > 7) {
-      note = `No data found for the exact date. Using closest available date (${closestDate.toISOString().split('T')[0]}), which is ${Math.round(diffDays)} days away.`;
-    }
-
-    const price = prices[closestIndex];
-
-    res.json({
-      symbol,
-      requestedDate: date,
-      date: closestDate.toISOString().split('T')[0],
-      price: price,
-      currency: 'USD',
-      source: 'Finnhub',
-      note: note || undefined,
+    // Fallback: use the current price from the quote endpoint
+    const quoteResponse = await axios.get('https://finnhub.io/api/v1/quote', {
+      params: {
+        symbol: symbol,
+        token: FINNHUB_API_KEY,
+      },
     });
+
+    const currentPrice = quoteResponse.data.c; // current price
+    if (currentPrice) {
+      return res.json({
+        symbol,
+        requestedDate: date,
+        date: new Date().toISOString().split('T')[0],
+        price: currentPrice,
+        currency: 'USD',
+        source: 'Finnhub (current price)',
+        note: 'Historical price not available – using current price',
+      });
+    }
+
+    res.status(404).json({ error: 'No data found for this symbol' });
   } catch (error) {
-    console.error('Finnhub historical price error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch historical price' });
+    console.error('Finnhub error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch price' });
   }
 });
 
