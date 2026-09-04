@@ -17,13 +17,14 @@ app.use(express.json());
 // Serve static files from the 'public' folder (sitemap.xml, etc.)
 app.use(express.static(path.join(__dirname, '../public')));
 
-// Routes – note the new /api/stocks-list path
+// Routes
 app.use('/api/stocks-list', require('./routes/stocksList'));
 app.use('/api/stocks', require('./routes/stocks'));
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/portfolio', require('./routes/portfolio'));
 app.use('/api/simulate', require('./routes/simulate'));
 app.use('/api/admin', require('./routes/admin'));
+app.use('/api/historical-price', require('./routes/historicalPrice'));
 
 app.get('/api/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
