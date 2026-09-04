@@ -1,89 +1,107 @@
-const express = require('express');
-const axios = require('axios');
+import express from 'express';
+import axios from 'axios';
 const router = express.Router();
 
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+// Polygon.io API endpoint
+const POLYGON_BASE_URL = 'https://api.polygon.io';
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 
-router.get('/', async (req, res) => {
-  const { symbol, date } = req.query;
-  if (!symbol || !date) {
-    return res.status(400).json({ error: 'Symbol and date are required' });
-  }
-
+// Get historical prices for a stock
+router.get('/:symbol', async (req, res) => {
   try {
-    // Try to get historical data (may fail on free tier)
-    const targetDate = new Date(date);
-    const toTimestamp = Math.floor(targetDate.getTime() / 1000);
-    const fromDate = new Date(targetDate);
-    fromDate.setDate(fromDate.getDate() - 30);
-    const fromTimestamp = Math.floor(fromDate.getTime() / 1000);
+    const { symbol } = req.params;
+    const { from, to, timeframe = 'day' } = req.query;
 
-    const response = await axios.get('https://finnhub.io/api/v1/stock/candle', {
+    if (!POLYGON_API_KEY) {
+      return res.status(500).json({ 
+        error: 'Polygon API key not configured' 
+      });
+    }
+
+    // Build the Polygon API URL
+    // Format: /v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from}/{to}
+    const multiplier = timeframe === 'day' ? 1 : 1;
+    const timespan = timeframe === 'day' ? 'day' : 'day';
+    
+    // Format dates for Polygon (YYYY-MM-DD)
+    const fromDate = from || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const toDate = to || new Date().toISOString().split('T')[0];
+
+    // Polygon API URL
+    const url = `${POLYGON_BASE_URL}/v2/aggs/ticker/${symbol}/range/${multiplier}/${timespan}/${fromDate}/${toDate}`;
+
+    const response = await axios.get(url, {
       params: {
-        symbol: symbol,
-        resolution: 'D',
-        from: fromTimestamp,
-        to: toTimestamp,
-        token: FINNHUB_API_KEY,
-      },
-    });
-
-    const data = response.data;
-
-    // If we get a valid response with prices, use it
-    if (data.s !== 'no_data' && data.c && data.c.length > 0) {
-      // ... (find the closest price logic)
-      const prices = data.c;
-      const timestamps = data.t;
-      const targetDateMs = targetDate.getTime();
-      let closestIndex = 0;
-      let closestDiff = Infinity;
-
-      for (let i = 0; i < timestamps.length; i++) {
-        const diff = Math.abs(timestamps[i] * 1000 - targetDateMs);
-        if (diff < closestDiff) {
-          closestDiff = diff;
-          closestIndex = i;
-        }
+        adjusted: true,
+        sort: 'asc',
+        limit: 5000,
+        apiKey: POLYGON_API_KEY
       }
-
-      const closestDate = new Date(timestamps[closestIndex] * 1000);
-      return res.json({
-        symbol,
-        requestedDate: date,
-        date: closestDate.toISOString().split('T')[0],
-        price: prices[closestIndex],
-        currency: 'USD',
-        source: 'Finnhub',
-      });
-    }
-
-    // Fallback: use the current price from the quote endpoint
-    const quoteResponse = await axios.get('https://finnhub.io/api/v1/quote', {
-      params: {
-        symbol: symbol,
-        token: FINNHUB_API_KEY,
-      },
     });
 
-    const currentPrice = quoteResponse.data.c; // current price
-    if (currentPrice) {
-      return res.json({
-        symbol,
-        requestedDate: date,
-        date: new Date().toISOString().split('T')[0],
-        price: currentPrice,
-        currency: 'USD',
-        source: 'Finnhub (current price)',
-        note: 'Historical price not available – using current price',
-      });
+    if (response.data.status === 'ERROR') {
+      throw new Error(response.data.error || 'Polygon API error');
     }
 
-    res.status(404).json({ error: 'No data found for this symbol' });
+    // Transform Polygon data to match your frontend format
+    const results = response.data.results || [];
+    const transformedData = results.map(item => ({
+      date: new Date(item.t).toISOString().split('T')[0],
+      open: item.o,
+      high: item.h,
+      low: item.l,
+      close: item.c,
+      volume: item.v
+    }));
+
+    res.json({
+      symbol: symbol,
+      from: fromDate,
+      to: toDate,
+      timeframe: timeframe,
+      data: transformedData
+    });
+
   } catch (error) {
-    console.error('Finnhub error:', error.message);
-    res.status(500).json({ error: 'Failed to fetch price' });
+    console.error('Error fetching historical data from Polygon:', error);
+    
+    // Fallback to Yahoo Finance if Polygon fails
+    try {
+      console.log('Trying Yahoo Finance fallback...');
+      const yahooData = await getHistoricalFromYahoo(req.params.symbol, req.query.from, req.query.to);
+      return res.json(yahooData);
+    } catch (fallbackError) {
+      return res.status(500).json({ 
+        error: 'Failed to fetch historical data',
+        details: error.message 
+      });
+    }
   }
 });
 
-module.exports = router;
+// Fallback: Yahoo Finance (using yahoo-finance2)
+async function getHistoricalFromYahoo(symbol, from, to) {
+  const yahooFinance = await import('yahoo-finance2');
+  
+  const queryOptions = {
+    period1: from || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000),
+    period2: to || new Date(),
+    interval: '1d',
+  };
+  
+  const result = await yahooFinance.historical(symbol, queryOptions);
+  
+  return {
+    symbol: symbol,
+    data: result.map(item => ({
+      date: item.date.toISOString().split('T')[0],
+      open: item.open,
+      high: item.high,
+      low: item.low,
+      close: item.close,
+      volume: item.volume
+    }))
+  };
+}
+
+export default router;
