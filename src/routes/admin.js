@@ -1,6 +1,6 @@
-import express from 'express';
-import { Stock } from '../models/stock.js';
-import yahooFinance from 'yahoo-finance2';
+const express = require('express');
+const Stock = require('../models/stock');
+const yahooFinance = require('yahoo-finance2');
 
 const router = express.Router();
 
@@ -20,12 +20,8 @@ router.post('/refresh', async (req, res) => {
     for (const symbol of usSymbols) {
       try {
         const quote = await yahooFinance.quote(symbol);
-        const history = await yahooFinance.historical(symbol, {
-          period1: '2023-01-01',
-          interval: '1d'
-        });
-
-        // Calculate dividend yield (annual dividend / price)
+        
+        // Calculate dividend yield
         const annualDividend = quote.trailingAnnualDividendRate || 0;
         const yield_ = quote.regularMarketPrice ? (annualDividend / quote.regularMarketPrice * 100) : 0;
 
@@ -33,12 +29,9 @@ router.post('/refresh', async (req, res) => {
         const [stock, created] = await Stock.upsert({
           symbol: symbol,
           name: quote.longName || quote.shortName || symbol,
-          price: quote.regularMarketPrice || 0,
+          currentPrice: quote.regularMarketPrice || 0,
           market: 'US',
-          yield: yield_,
-          payoutRatio: quote.payoutRatio || 0,
-          peRatio: quote.trailingPE || 0,
-          marketCap: quote.marketCap || 0,
+          currentYield: yield_,
           lastUpdated: new Date()
         });
 
@@ -64,4 +57,4 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-export default router;
+module.exports = router;
