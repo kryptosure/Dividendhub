@@ -19,8 +19,13 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 
 // Routes
-app.use('/api/auth', require('./routes/auth'));
+app.use('/api/stocks/list', require('./routes/stocksList'));
+app.use('/api/stocks/list', (req, res, next) => {
+  console.log('📥 /api/stocks/list was called');
+  next();
+}, require('./routes/stocksList'));
 app.use('/api/stocks', require('./routes/stocks'));
+app.use('/api/auth', require('./routes/auth'));
 app.use('/api/portfolio', require('./routes/portfolio'));
 app.use('/api/simulate', require('./routes/simulate'));
 app.use('/api/admin', require('./routes/admin'));
