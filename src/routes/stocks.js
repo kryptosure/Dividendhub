@@ -4,7 +4,7 @@ const rateLimit = require('express-rate-limit');
 const { Op } = require('sequelize');
 const Stock = require('../models/stock');
 const { getStock, getBatchStocks } = require('../services/stockService');
-const { yahooSearch } = require('../services/yahooFinance');
+const { yahooSearch, fetchDividendsRaw, fetchPricesRaw } = require('../services/yahooFinance');
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -121,6 +121,90 @@ router.get('/search', limiter, async (req, res) => {
   } catch (e) {
     console.error('Search routing failure:', e);
     res.json([]);
+  }
+});
+
+// ✅ NEW: Historical Long-Term Growth ($1,000 invested)
+// MUST BE PLACED ABOVE THE /:symbol ROUTE
+router.get('/long-term-growth', limiter, async (req, res) => {
+  let symbol = String(req.query.symbol || '').trim().toUpperCase();
+  const market = String(req.query.market || 'us').toLowerCase();
+  const amount = Number(req.query.amount) || 1000;
+
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+  if (market === 'sg' && !symbol.endsWith('.SI')) symbol += '.SI';
+
+  try {
+    // Fetch current price
+    const { meta } = await fetchPricesRaw(symbol, Math.floor(Date.now() / 1000) - 90 * 86400);
+    const currentPrice = meta.regularMarketPrice;
+    if (!currentPrice) throw new Error('Could not determine current price');
+
+    const periods = [1, 5, 10, 20, 30];
+    const noDrip = [];
+    const drip = [];
+
+    for (const yearsAgo of periods) {
+      const startDate = new Date();
+      startDate.setFullYear(startDate.getFullYear() - yearsAgo);
+      const startEpoch = Math.floor(startDate.getTime() / 1000);
+
+      // Fetch prices and dividends for the period
+      const { timestamps, closes } = await fetchPricesRaw(symbol, startEpoch - 30 * 86400);
+      const { dividends } = await fetchDividendsRaw(symbol, market);
+
+      // Find price on or before startEpoch
+      let buyPrice = null;
+      for (let i = 0; i < timestamps.length; i++) {
+        if (timestamps[i] <= startEpoch) buyPrice = closes[i];
+        else break;
+      }
+
+      // FALLBACK: If no price exists for that exact epoch, use the earliest available price from the fetched history
+      if (!buyPrice && closes.length > 0) {
+        buyPrice = closes[0];
+      }
+
+      if (!buyPrice) {
+        noDrip.push(null);
+        drip.push(null);
+        continue;
+      }
+
+      const sharesPurchased = amount / buyPrice;
+      const noDripValue = sharesPurchased * currentPrice;
+
+      // Simulate DRIP (Reinvest dividends at next trading day's close)
+      let simulatedShares = sharesPurchased;
+      const divs = dividends.filter(d => d.epoch > startEpoch);
+      for (const d of divs) {
+        const cashFromDiv = simulatedShares * d.amount;
+        // Find next trading day's price
+        let reinvestPrice = null;
+        for (let i = 0; i < timestamps.length; i++) {
+          if (timestamps[i] > d.epoch) {
+            reinvestPrice = closes[i];
+            break;
+          }
+        }
+        if (reinvestPrice && reinvestPrice > 0) {
+          simulatedShares += cashFromDiv / reinvestPrice;
+        }
+      }
+
+      const dripValue = simulatedShares * currentPrice;
+      noDrip.push(Math.round(noDripValue * 100) / 100);
+      drip.push(Math.round(dripValue * 100) / 100);
+    }
+
+    res.json({
+      currencySymbol: market === 'sg' ? 'S$' : '$',
+      noDrip,
+      drip
+    });
+  } catch (e) {
+    console.error('Error fetching long-term growth:', e);
+    res.status(500).json({ error: 'Failed to fetch long-term growth data' });
   }
 });
 
