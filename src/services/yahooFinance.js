@@ -79,18 +79,30 @@ async function fetchSplitsRaw(symbol) {
   return splits;
 }
 
-// ---- Yahoo search (used for name resolution and search) ----
+// ---- Yahoo search (Updated: Fixed filtering for obscure tickers & REITs) ----
 async function yahooSearch(q, market) {
   const region = market === 'sg' ? 'SG' : 'US';
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=24&newsCount=0&lang=en-US&region=${region}`;
+  
   const data = await fetchJson(url);
   const quotes = data.quotes || [];
+  
   let filtered;
+  
   if (market === 'sg') {
-    filtered = quotes.filter(x => String(x.symbol || '').endsWith('.SI') && x.quoteType === 'EQUITY');
+    // SGX Fix: Include EQUITY, MUTUALFUND, and TRUST/ETF to catch REITs and Business Trusts ending in .SI
+    filtered = quotes.filter(x => 
+      String(x.symbol || '').toUpperCase().endsWith('.SI') && 
+      ['EQUITY', 'MUTUALFUND', 'ETF', 'TRUST'].includes(x.quoteType)
+    );
   } else {
-    filtered = quotes.filter(x => (x.quoteType === 'EQUITY' || x.quoteType === 'ETF') && !String(x.symbol).includes('.'));
+    // US Fix: Include standard equities/ETFs, but allow characters like hyphens/dots for preferred classes
+    filtered = quotes.filter(x => 
+      ['EQUITY', 'ETF'].includes(x.quoteType) && 
+      (x.exchange === 'NYQ' || x.exchange === 'NMS' || x.exchange === 'BATS' || x.exchange === 'PCX' || !String(x.symbol).includes(':'))
+    );
   }
+  
   return filtered.map(x => ({
     symbol: x.symbol,
     shortname: x.shortname || x.symbol,

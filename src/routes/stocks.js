@@ -42,7 +42,7 @@ const FALLBACK_MAP = {
   }
 };
 
-// ---------- Search ----------
+// ---------- Search (Updated: Combined DB + Live API Merging) ----------
 router.get('/search', limiter, async (req, res) => {
   const q = String(req.query.q || '').trim();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -50,13 +50,14 @@ router.get('/search', limiter, async (req, res) => {
   if (q.length < 2) return res.json([]);
 
   try {
-    let results = [];
+    let yahooResults = [];
+    let dbResults = [];
 
-    // 1. Yahoo
+    // 1. Fetch from Live Yahoo API with expanded asset class support
     try {
       const yahoo = await yahooSearch(q, market);
       if (yahoo && yahoo.length > 0) {
-        results = yahoo.map(item => ({
+        yahooResults = yahoo.map(item => ({
           symbol: item.symbol,
           shortname: item.shortname || item.symbol,
           longname: item.longname || item.shortname || item.symbol,
@@ -64,12 +65,12 @@ router.get('/search', limiter, async (req, res) => {
         }));
       }
     } catch (e) {
-      console.warn('Yahoo search failed:', e.message);
+      console.warn('Yahoo live search failed:', e.message);
     }
 
-    // 2. Database
-    if (results.length === 0) {
-      const dbResults = await Stock.findAll({
+    // 2. Fetch from Local Database to display cached/seeded assets instantly
+    try {
+      const stocks = await Stock.findAll({
         where: {
           market,
           [Op.or]: [
@@ -77,23 +78,35 @@ router.get('/search', limiter, async (req, res) => {
             { name: { [Op.iLike]: `%${q}%` } },
           ],
         },
-        limit: 10,
+        limit: 5,
       });
-      results = dbResults.map(s => ({
+      dbResults = stocks.map(s => ({
         symbol: s.symbol,
         shortname: s.name || s.symbol,
         longname: s.name || s.symbol,
         exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
       }));
+    } catch (e) {
+      console.warn('Database search fallback failed:', e.message);
     }
 
-    // 3. Fallback
-    if (results.length === 0) {
+    // 3. Merge, Deduplicate by symbol (Prioritising Live Data for accurate sizing)
+    const combined = [...yahooResults, ...dbResults];
+    const seen = new Set();
+    let unique = combined.filter(item => {
+      const key = item.symbol.toUpperCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // 4. Hardcoded Fallback Map fallback (Last Resort)
+    if (unique.length === 0) {
       const normalized = q.toLowerCase().trim();
       const map = FALLBACK_MAP[market] || FALLBACK_MAP.us;
       for (const [key, items] of Object.entries(map)) {
         if (normalized.includes(key) || key.includes(normalized)) {
-          results = items.map(item => ({
+          unique = items.map(item => ({
             symbol: item.symbol,
             shortname: item.name,
             longname: item.name,
@@ -104,18 +117,9 @@ router.get('/search', limiter, async (req, res) => {
       }
     }
 
-    // Deduplicate
-    const seen = new Set();
-    const unique = results.filter(item => {
-      const key = item.symbol;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
     res.json(unique.slice(0, 10));
   } catch (e) {
-    console.error('Search error:', e);
+    console.error('Search routing failure:', e);
     res.json([]);
   }
 });
