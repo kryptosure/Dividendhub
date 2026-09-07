@@ -1,8 +1,8 @@
 const { fetchJson, sleep, currencySymbol, round2, pct, isoOf } = require('../utils/helpers');
+const yahooFinance = require('yahoo-finance2'); 
 
 const UA = process.env.YAHOO_FINANCE_UA || 'Mozilla/5.0 (compatible; DividendHub/2.0)';
 
-// ---- Raw dividend fetcher ----
 async function fetchDividendsRaw(symbol, market) {
   const now = Math.floor(Date.now() / 1000);
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=0&period2=${now}&interval=1d&events=div`;
@@ -23,7 +23,6 @@ async function fetchDividendsRaw(symbol, market) {
   return { currency, dividends: out };
 }
 
-// ---- Resolve full company name ----
 async function resolveName(symbol, market) {
   try {
     const results = await yahooSearch(symbol.replace('.SI', ''), market);
@@ -35,7 +34,6 @@ async function resolveName(symbol, market) {
   }
 }
 
-// ---- Price fetcher ----
 async function fetchPricesRaw(symbol, startEpoch) {
   const now = Math.floor(Date.now() / 1000);
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=${startEpoch}&period2=${now}&interval=1d&includeAdjustedClose=true`;
@@ -50,20 +48,20 @@ async function fetchPricesRaw(symbol, startEpoch) {
   return { meta, timestamps: ts, closes };
 }
 
-// ---- EPS fetcher ----
 async function fetchEPSRaw(symbol) {
-  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${symbol}?modules=defaultKeyStatistics,financialData`;
   try {
-    const data = await fetchJson(url);
-    const result = data.quoteSummary?.result?.[0];
-    if (!result) return null;
+    const result = await yahooFinance.quoteSummary(symbol, {
+      modules: ['defaultKeyStatistics', 'financialData']
+    });
     const stats = result.defaultKeyStatistics || {};
     const fin = result.financialData || {};
     return stats.trailingEps?.raw || stats.forwardEps?.raw || fin.trailingEps?.raw || null;
-  } catch { return null; }
+  } catch (e) {
+    console.warn('Yahoo Finance quoteSummary failed for EPS:', symbol, e.message);
+    return null;
+  }
 }
 
-// ---- Splits fetcher ----
 async function fetchSplitsRaw(symbol) {
   const now = Math.floor(Date.now() / 1000);
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=0&period2=${now}&interval=1d&events=split`;
@@ -79,7 +77,6 @@ async function fetchSplitsRaw(symbol) {
   return splits;
 }
 
-// ---- Yahoo search (Updated: Fixed filtering for obscure tickers & REITs) ----
 async function yahooSearch(q, market) {
   const region = market === 'sg' ? 'SG' : 'US';
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=24&newsCount=0&lang=en-US&region=${region}`;
@@ -90,13 +87,11 @@ async function yahooSearch(q, market) {
   let filtered;
   
   if (market === 'sg') {
-    // SGX Fix: Include EQUITY, MUTUALFUND, and TRUST/ETF to catch REITs and Business Trusts ending in .SI
     filtered = quotes.filter(x => 
       String(x.symbol || '').toUpperCase().endsWith('.SI') && 
       ['EQUITY', 'MUTUALFUND', 'ETF', 'TRUST'].includes(x.quoteType)
     );
   } else {
-    // US Fix: Include standard equities/ETFs, but allow characters like hyphens/dots for preferred classes
     filtered = quotes.filter(x => 
       ['EQUITY', 'ETF'].includes(x.quoteType) && 
       (x.exchange === 'NYQ' || x.exchange === 'NMS' || x.exchange === 'BATS' || x.exchange === 'PCX' || !String(x.symbol).includes(':'))
@@ -111,26 +106,13 @@ async function yahooSearch(q, market) {
   }));
 }
 
-// ---- Main dividend data fetcher (full) ----
 async function fetchDividendData(symbol, market) {
   try {
     const { currency, dividends } = await fetchDividendsRaw(symbol, market);
+    let payoutRatio = null;
+
     if (!dividends.length) {
-      return {
-        symbol,
-        currency: currency || (market === 'sg' ? 'SGD' : 'USD'),
-        currencySymbol: currencySymbol(currency || 'USD', market),
-        name: symbol,
-        totalDividend: 0,
-        payoutCount: 0,
-        byYear: [],
-        message: 'No dividend history found.',
-        currentPrice: null,
-        currentYield: null,
-        dividendCAGR: null,
-        safetyScore: 'Caution',
-        exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
-      };
+      return { symbol, currency: currency || (market === 'sg' ? 'SGD' : 'USD'), currencySymbol: currencySymbol(currency || 'USD', market), name: symbol, totalDividend: 0, payoutCount: 0, byYear: [], message: 'No dividend history found.', currentPrice: null, currentYield: null, dividendCAGR: null, payoutRatio: null, safetyScore: 'Caution', exchange: market === 'sg' ? 'SGX' : 'NASDAQ' };
     }
 
     const byYearMap = {};
@@ -174,7 +156,6 @@ async function fetchDividendData(symbol, market) {
       }
     } catch (e) { /* skip */ }
 
-    // Compute CAGR (5‑year)
     try {
       const years = Object.keys(byYearMap).map(Number).sort((a, b) => a - b);
       if (years.length >= 2) {
@@ -198,7 +179,6 @@ async function fetchDividendData(symbol, market) {
       }
     } catch (e) { /* skip */ }
 
-    // Safety score
     let safetyScore = 'Caution';
     try {
       const years = Object.keys(byYearMap).map(Number).sort((a,b)=>a-b);
@@ -231,7 +211,7 @@ async function fetchDividendData(symbol, market) {
       try {
         const eps = await fetchEPSRaw(symbol);
         if (eps && eps > 0 && trailingAnnualDiv > 0) {
-          const payoutRatio = (trailingAnnualDiv / eps) * 100;
+          payoutRatio = (trailingAnnualDiv / eps) * 100;
           if (payoutRatio < 70) score += 2;
           else if (payoutRatio < 90) score += 1;
           if (payoutRatio > 0 && payoutRatio < 100) score += 1;
@@ -241,49 +221,11 @@ async function fetchDividendData(symbol, market) {
       else if (score >= 3) safetyScore = 'Moderate';
     } catch (e) { /* ignore */ }
 
-    return {
-      symbol,
-      name,
-      currency: currency || 'USD',
-      currencySymbol: currencySymbol(currency || 'USD', market),
-      totalDividend: Math.round(total * 1e6) / 1e6,
-      payoutCount: dividends.length,
-      firstExDate: dates[0] || null,
-      lastExDate: dates[dates.length - 1] || null,
-      byYear,
-      currentPrice: currentPrice ? round2(currentPrice) : null,
-      currentYield,
-      dividendCAGR,
-      trailingAnnualDiv,
-      safetyScore,
-      exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
-    };
+    return { symbol, name, currency: currency || 'USD', currencySymbol: currencySymbol(currency || 'USD', market), totalDividend: Math.round(total * 1e6) / 1e6, payoutCount: dividends.length, firstExDate: dates[0] || null, lastExDate: dates[dates.length - 1] || null, byYear, currentPrice: currentPrice ? round2(currentPrice) : null, currentYield, dividendCAGR, trailingAnnualDiv, payoutRatio: payoutRatio ? Math.round(payoutRatio * 100) / 100 : null, safetyScore, exchange: market === 'sg' ? 'SGX' : 'NASDAQ' };
   } catch (e) {
     console.error('fetchDividendData error:', e);
-    return {
-      symbol,
-      currency: market === 'sg' ? 'SGD' : 'USD',
-      currencySymbol: market === 'sg' ? 'S$' : '$',
-      name: symbol,
-      totalDividend: 0,
-      payoutCount: 0,
-      byYear: [],
-      message: e.message || 'Failed to fetch dividend data',
-      currentPrice: null,
-      currentYield: null,
-      dividendCAGR: null,
-      safetyScore: 'Caution',
-      exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
-    };
+    return { symbol, currency: market === 'sg' ? 'SGD' : 'USD', currencySymbol: market === 'sg' ? 'S$' : '$', name: symbol, totalDividend: 0, payoutCount: 0, byYear: [], message: e.message || 'Failed to fetch dividend data', currentPrice: null, currentYield: null, dividendCAGR: null, payoutRatio: null, safetyScore: 'Caution', exchange: market === 'sg' ? 'SGX' : 'NASDAQ' };
   }
 }
 
-module.exports = {
-  fetchDividendData,
-  fetchDividendsRaw,
-  fetchPricesRaw,
-  fetchEPSRaw,
-  fetchSplitsRaw,
-  resolveName,
-  yahooSearch,
-};
+module.exports = { fetchDividendData, fetchDividendsRaw, fetchPricesRaw, fetchEPSRaw, fetchSplitsRaw, resolveName, yahooSearch };
