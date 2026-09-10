@@ -121,7 +121,7 @@ router.get('/search', limiter, async (req, res) => {
 });
 
 // ✅ UPDATED: Historical Long-Term Growth ($1,000 invested)
-// - Fetches 30 years of data ONCE (much faster)
+// - Fetches 35 years of data ONCE (safety buffer for leap years + edge cases)
 // - Returns null for periods where the stock didn't exist yet
 router.get('/long-term-growth', limiter, async (req, res) => {
   let symbol = String(req.query.symbol || '').trim().toUpperCase();
@@ -137,9 +137,9 @@ router.get('/long-term-growth', limiter, async (req, res) => {
     const currentPrice = meta.regularMarketPrice;
     if (!currentPrice) throw new Error('Could not determine current price');
 
-    // 2. Fetch 30 years of history ONCE (not 5 separate calls)
-    const thirtyYearsAgo = Math.floor((Date.now() - 30 * 365 * 86400 * 1000) / 1000);
-    const { timestamps, closes } = await fetchPricesRaw(symbol, thirtyYearsAgo);
+    // 2. Fetch from 35 years ago (safety buffer for leap years + edge cases)
+    const thirtyFiveYearsAgo = Math.floor(Date.now() / 1000) - (35 * 365 * 86400);
+    const { timestamps, closes } = await fetchPricesRaw(symbol, thirtyFiveYearsAgo);
     const { dividends } = await fetchDividendsRaw(symbol, market);
 
     // 3. Determine the earliest available data point
