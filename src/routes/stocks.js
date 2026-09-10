@@ -42,7 +42,7 @@ const FALLBACK_MAP = {
   }
 };
 
-// ---------- Search (Updated: Combined DB + Live API Merging) ----------
+// ---------- Search (Combined DB + Live API Merging) ----------
 router.get('/search', limiter, async (req, res) => {
   const q = String(req.query.q || '').trim();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -53,7 +53,6 @@ router.get('/search', limiter, async (req, res) => {
     let yahooResults = [];
     let dbResults = [];
 
-    // 1. Fetch from Live Yahoo API with expanded asset class support
     try {
       const yahoo = await yahooSearch(q, market);
       if (yahoo && yahoo.length > 0) {
@@ -68,7 +67,6 @@ router.get('/search', limiter, async (req, res) => {
       console.warn('Yahoo live search failed:', e.message);
     }
 
-    // 2. Fetch from Local Database to display cached/seeded assets instantly
     try {
       const stocks = await Stock.findAll({
         where: {
@@ -90,7 +88,6 @@ router.get('/search', limiter, async (req, res) => {
       console.warn('Database search fallback failed:', e.message);
     }
 
-    // 3. Merge, Deduplicate by symbol (Prioritising Live Data for accurate sizing)
     const combined = [...yahooResults, ...dbResults];
     const seen = new Set();
     let unique = combined.filter(item => {
@@ -100,7 +97,6 @@ router.get('/search', limiter, async (req, res) => {
       return true;
     });
 
-    // 4. Hardcoded Fallback Map fallback (Last Resort)
     if (unique.length === 0) {
       const normalized = q.toLowerCase().trim();
       const map = FALLBACK_MAP[market] || FALLBACK_MAP.us;
@@ -124,8 +120,9 @@ router.get('/search', limiter, async (req, res) => {
   }
 });
 
-// ✅ NEW: Historical Long-Term Growth ($1,000 invested)
-// MUST BE PLACED ABOVE THE /:symbol ROUTE
+// ✅ UPDATED: Historical Long-Term Growth ($1,000 invested)
+// - Fetches 30 years of data ONCE (much faster)
+// - Returns null for periods where the stock didn't exist yet
 router.get('/long-term-growth', limiter, async (req, res) => {
   let symbol = String(req.query.symbol || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -135,10 +132,18 @@ router.get('/long-term-growth', limiter, async (req, res) => {
   if (market === 'sg' && !symbol.endsWith('.SI')) symbol += '.SI';
 
   try {
-    // Fetch current price
+    // 1. Fetch current price
     const { meta } = await fetchPricesRaw(symbol, Math.floor(Date.now() / 1000) - 90 * 86400);
     const currentPrice = meta.regularMarketPrice;
     if (!currentPrice) throw new Error('Could not determine current price');
+
+    // 2. Fetch 30 years of history ONCE (not 5 separate calls)
+    const thirtyYearsAgo = Math.floor((Date.now() - 30 * 365 * 86400 * 1000) / 1000);
+    const { timestamps, closes } = await fetchPricesRaw(symbol, thirtyYearsAgo);
+    const { dividends } = await fetchDividendsRaw(symbol, market);
+
+    // 3. Determine the earliest available data point
+    const earliestEpoch = timestamps.length > 0 ? timestamps[0] : null;
 
     const periods = [1, 5, 10, 20, 30];
     const noDrip = [];
@@ -149,20 +154,18 @@ router.get('/long-term-growth', limiter, async (req, res) => {
       startDate.setFullYear(startDate.getFullYear() - yearsAgo);
       const startEpoch = Math.floor(startDate.getTime() / 1000);
 
-      // Fetch prices and dividends for the period
-      const { timestamps, closes } = await fetchPricesRaw(symbol, startEpoch - 30 * 86400);
-      const { dividends } = await fetchDividendsRaw(symbol, market);
+      // ✅ If the stock didn't exist yet, return null for this period
+      if (!earliestEpoch || earliestEpoch > startEpoch) {
+        noDrip.push(null);
+        drip.push(null);
+        continue;
+      }
 
       // Find price on or before startEpoch
       let buyPrice = null;
       for (let i = 0; i < timestamps.length; i++) {
         if (timestamps[i] <= startEpoch) buyPrice = closes[i];
         else break;
-      }
-
-      // FALLBACK: If no price exists for that exact epoch, use the earliest available price from the fetched history
-      if (!buyPrice && closes.length > 0) {
-        buyPrice = closes[0];
       }
 
       if (!buyPrice) {
@@ -179,7 +182,6 @@ router.get('/long-term-growth', limiter, async (req, res) => {
       const divs = dividends.filter(d => d.epoch > startEpoch);
       for (const d of divs) {
         const cashFromDiv = simulatedShares * d.amount;
-        // Find next trading day's price
         let reinvestPrice = null;
         for (let i = 0; i < timestamps.length; i++) {
           if (timestamps[i] > d.epoch) {
