@@ -1,5 +1,5 @@
 /* backend/src/routes/chat.js
- * AI chat proxy with rate limiting, compliance guardrails, and model fallback.
+ * AI chat proxy with rate limiting, compliance guardrails, and contextual stock awareness.
  */
 
 const express = require('express');
@@ -13,7 +13,6 @@ const DAILY_LIMIT = 10;
 const MINUTE_LIMIT = 5;
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-// Model fallback chain — tried in order until one succeeds
 const MODELS = [
   'nvidia/nemotron-3-super-120b-a12b:free',
   'z-ai/glm-5.2:free',
@@ -21,8 +20,8 @@ const MODELS = [
   'google/gemma-4-31b-it:free',
 ];
 
-// ---------- SYSTEM PROMPT ----------
-const SYSTEM_PROMPT = `You are DividendBro AI, an educational assistant for dividend investing on dividendbro.com.
+// ---------- BASE SYSTEM PROMPT ----------
+const BASE_SYSTEM_PROMPT = `You are DividendBro AI, an educational assistant for dividend investing on dividendbro.com.
 
 STRICT RULES — you must follow these at all times:
 1. NEVER recommend buying, selling, or holding any specific stock.
@@ -38,7 +37,35 @@ STRICT RULES — you must follow these at all times:
 
 Tone: friendly, clear, helpful. No emojis unless the user uses them first.`;
 
-// ---------- IN-MEMORY RATE LIMITER ----------
+// ---------- BUILD CONTEXT-AWARE PROMPT ----------
+function buildSystemPrompt(context) {
+  if (!context || !context.symbol) return BASE_SYSTEM_PROMPT;
+
+  const metrics = [];
+  if (context.name) metrics.push(`- Name: ${context.name}`);
+  if (context.symbol) metrics.push(`- Symbol: ${context.symbol}`);
+  if (context.market) metrics.push(`- Market: ${context.market.toUpperCase()}`);
+  if (context.price != null) metrics.push(`- Current Price: ${context.currencySymbol || '$'}${Number(context.price).toFixed(2)}`);
+  if (context.yield != null) metrics.push(`- Current Dividend Yield: ${Number(context.yield).toFixed(2)}%`);
+  if (context.totalDividend != null) metrics.push(`- Total Dividends Paid (per share, all-time): ${context.currencySymbol || '$'}${Number(context.totalDividend).toFixed(2)}`);
+  if (context.payoutCount != null) metrics.push(`- Number of Payouts on Record: ${context.payoutCount}`);
+  if (context.payoutRatio != null) metrics.push(`- Payout Ratio: ${Number(context.payoutRatio).toFixed(2)}%`);
+  if (context.dividendCAGR != null) metrics.push(`- 5Y Dividend CAGR: ${Number(context.dividendCAGR).toFixed(2)}%`);
+  if (context.safetyScore) metrics.push(`- Safety Score: ${context.safetyScore}`);
+  if (context.lastExDate) metrics.push(`- Last Ex-Dividend Date: ${context.lastExDate}`);
+  if (context.sector) metrics.push(`- Sector: ${context.sector}`);
+
+  return `${BASE_SYSTEM_PROMPT}
+
+--- CURRENT CONTEXT ---
+The user is currently viewing this stock on DividendBro.com:
+${metrics.join('\n')}
+
+When answering, prioritise this stock. Use the exact metrics above when relevant. Do NOT invent metrics that are not listed above. If the user asks about something you don't have data for, say so.
+--- END CONTEXT ---`;
+}
+
+// ---------- RATE LIMITER ----------
 const userRateLimits = new Map();
 
 function checkRateLimit(key) {
@@ -82,7 +109,7 @@ router.post('/', async (req, res) => {
     return res.status(429).json({ error: rateCheck.reason });
   }
 
-  const { messages } = req.body;
+  const { messages, context } = req.body;
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'messages array required' });
   }
@@ -92,12 +119,15 @@ router.post('/', async (req, res) => {
     content: String(m.content || '').slice(0, 2000),
   }));
 
+  const systemPrompt = buildSystemPrompt(context);
+  if (context?.symbol) console.log(`📊 Chat context: ${context.symbol}`);
+
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'AI service not configured' });
 
     const payload = {
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...recentMessages],
+      messages: [{ role: 'system', content: systemPrompt }, ...recentMessages],
       max_tokens: 500,
       temperature: 0.5,
     };
