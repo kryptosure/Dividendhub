@@ -31,6 +31,9 @@ app.use('/api/simulate', require('./routes/simulate'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/historical-price', require('./routes/historicalPrice'));
 
+// ✅ NEW: AI Chat proxy
+app.use('/api/chat', require('./routes/chat'));
+
 // ---------- NEW: /api/search endpoint ----------
 // Fallback map for common names (as a last resort)
 const FALLBACK_MAP = {
@@ -71,7 +74,6 @@ app.get('/api/search', async (req, res) => {
   try {
     let results = [];
 
-    // 1. Query Yahoo Finance (good for US and popular SGX)
     try {
       const yahoo = await yahooSearch(q, market);
       if (yahoo && yahoo.length > 0) {
@@ -85,7 +87,6 @@ app.get('/api/search', async (req, res) => {
       console.warn('Yahoo search failed:', e.message);
     }
 
-    // 2. ALWAYS query your local database (this covers all SGX stocks you have)
     let dbResults = [];
     try {
       const stocks = await Stock.findAll({
@@ -108,7 +109,6 @@ app.get('/api/search', async (req, res) => {
       console.warn('Database search failed:', e.message);
     }
 
-    // Merge Yahoo + DB, deduplicate by symbol
     const all = [...results, ...dbResults];
     const seen = new Set();
     const unique = all.filter(item => {
@@ -118,7 +118,6 @@ app.get('/api/search', async (req, res) => {
       return true;
     });
 
-    // 3. Hardcoded fallback (only if still empty)
     if (unique.length === 0) {
       const normalized = q.toLowerCase().trim();
       const map = FALLBACK_MAP[market] || FALLBACK_MAP.us;
@@ -134,7 +133,6 @@ app.get('/api/search', async (req, res) => {
       }
     }
 
-    // Return max 10 results in the format frontend expects
     const response = unique.slice(0, 10).map(item => ({
       symbol: item.symbol,
       name: item.name,
