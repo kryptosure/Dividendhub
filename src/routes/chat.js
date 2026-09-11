@@ -1,5 +1,6 @@
 /* backend/src/routes/chat.js
- * AI chat proxy with rate limiting, compliance guardrails, and contextual stock awareness.
+ * AI chat proxy with rate limiting, compliance guardrails, and context awareness.
+ * Supports two context types: 'stock' (single ticker) and 'portfolio' (user holdings).
  */
 
 const express = require('express');
@@ -30,39 +31,96 @@ STRICT RULES — you must follow these at all times:
 4. ALWAYS frame answers as educational explanations.
 5. ALWAYS append this exact sentence at the end of your answer: "This is educational only, not financial advice."
 6. If the user asks for a recommendation, reply: "I can share general information about dividends and stocks, but I cannot recommend specific investments. Please consult a licensed financial adviser."
-7. Keep answers under 200 words unless the user explicitly asks for detail.
+7. Keep answers under 250 words unless the user explicitly asks for detail.
 8. Use plain English. Explain jargon when you use it.
 9. If you don't know something, say "I don't have that information" — never guess.
 10. You focus on: dividend yields, payout ratios, DRIP, dividend streaks, REITs, US and SGX stocks.
 
 Tone: friendly, clear, helpful. No emojis unless the user uses them first.`;
 
-// ---------- BUILD CONTEXT-AWARE PROMPT ----------
-function buildSystemPrompt(context) {
-  if (!context || !context.symbol) return BASE_SYSTEM_PROMPT;
-
+// ---------- BUILD STOCK CONTEXT PROMPT ----------
+function buildStockPrompt(context) {
   const metrics = [];
   if (context.name) metrics.push(`- Name: ${context.name}`);
   if (context.symbol) metrics.push(`- Symbol: ${context.symbol}`);
   if (context.market) metrics.push(`- Market: ${context.market.toUpperCase()}`);
   if (context.price != null) metrics.push(`- Current Price: ${context.currencySymbol || '$'}${Number(context.price).toFixed(2)}`);
-  if (context.yield != null) metrics.push(`- Current Dividend Yield: ${Number(context.yield).toFixed(2)}%`);
+  if (context.yield != null) metrics.push(`- Dividend Yield: ${Number(context.yield).toFixed(2)}%`);
   if (context.totalDividend != null) metrics.push(`- Total Dividends Paid (per share, all-time): ${context.currencySymbol || '$'}${Number(context.totalDividend).toFixed(2)}`);
   if (context.payoutCount != null) metrics.push(`- Number of Payouts on Record: ${context.payoutCount}`);
   if (context.payoutRatio != null) metrics.push(`- Payout Ratio: ${Number(context.payoutRatio).toFixed(2)}%`);
   if (context.dividendCAGR != null) metrics.push(`- 5Y Dividend CAGR: ${Number(context.dividendCAGR).toFixed(2)}%`);
   if (context.safetyScore) metrics.push(`- Safety Score: ${context.safetyScore}`);
   if (context.lastExDate) metrics.push(`- Last Ex-Dividend Date: ${context.lastExDate}`);
-  if (context.sector) metrics.push(`- Sector: ${context.sector}`);
 
   return `${BASE_SYSTEM_PROMPT}
 
 --- CURRENT CONTEXT ---
-The user is currently viewing this stock on DividendBro.com:
+The user is viewing this stock on DividendBro.com:
 ${metrics.join('\n')}
 
-When answering, prioritise this stock. Use the exact metrics above when relevant. Do NOT invent metrics that are not listed above. If the user asks about something you don't have data for, say so.
+When answering, prioritise this stock. Use the exact metrics above when relevant. Do NOT invent metrics that are not listed above.
 --- END CONTEXT ---`;
+}
+
+// ---------- BUILD PORTFOLIO CONTEXT PROMPT ----------
+function buildPortfolioPrompt(context) {
+  const { holdings = [], totals = {}, currency = 'USD', currencySymbol = '$' } = context;
+
+  const holdingLines = holdings.map((h, i) => {
+    const parts = [`${i + 1}. ${h.symbol}${h.name ? ' (' + h.name + ')' : ''}`];
+    if (h.shares != null) parts.push(`Shares: ${h.shares}`);
+    if (h.valueInBase != null) parts.push(`Value: ${currencySymbol}${Number(h.valueInBase).toFixed(2)}`);
+    if (h.yieldPct != null) parts.push(`Yield: ${Number(h.yieldPct).toFixed(2)}%`);
+    if (h.annualIncomeInBase != null) parts.push(`Annual income: ${currencySymbol}${Number(h.annualIncomeInBase).toFixed(2)}`);
+    if (h.gain != null) parts.push(`Gain/Loss: ${currencySymbol}${Number(h.gain).toFixed(2)}`);
+    if (h.gainPct != null) parts.push(`Return: ${Number(h.gainPct).toFixed(2)}%`);
+    if (h.safetyScore) parts.push(`Safety: ${h.safetyScore}`);
+    return parts.join(' | ');
+  }).join('\n');
+
+  const totalsLines = [
+    totals.totalValue != null ? `- Total Portfolio Value: ${currencySymbol}${Number(totals.totalValue).toFixed(2)}` : null,
+    totals.totalCostBasis != null ? `- Total Cost Basis: ${currencySymbol}${Number(totals.totalCostBasis).toFixed(2)}` : null,
+    totals.totalGain != null ? `- Total Capital Gain/Loss: ${currencySymbol}${Number(totals.totalGain).toFixed(2)}` : null,
+    totals.totalGainPct != null ? `- Total Return %: ${Number(totals.totalGainPct).toFixed(2)}%` : null,
+    totals.totalAnnualDividend != null ? `- Total Annual Dividend Income: ${currencySymbol}${Number(totals.totalAnnualDividend).toFixed(2)}` : null,
+    totals.totalDividendIncome != null ? `- Total Dividends Received (all-time): ${currencySymbol}${Number(totals.totalDividendIncome).toFixed(2)}` : null,
+    totals.avgYield != null ? `- Weighted Average Yield: ${Number(totals.avgYield).toFixed(2)}%` : null,
+    totals.holdingCount != null ? `- Number of Holdings: ${totals.holdingCount}` : null,
+    `- Base Currency: ${currency}`,
+  ].filter(Boolean).join('\n');
+
+  return `${BASE_SYSTEM_PROMPT}
+
+--- PORTFOLIO CONTEXT ---
+The user is asking about THEIR OWN dividend portfolio on DividendBro.com.
+You may reference the specific numbers below to answer factual questions about their portfolio.
+
+TOTALS:
+${totalsLines}
+
+HOLDINGS:
+${holdingLines}
+
+SPECIAL RULES FOR PORTFOLIO QUESTIONS:
+1. You MAY cite the exact numbers above (e.g., "Your total annual dividend income is $1,234.56").
+2. You MAY point out factual observations (e.g., "Your top holding is 45% of your portfolio").
+3. You MAY NOT recommend buying, selling, or rebalancing.
+4. You MAY NOT tell them their portfolio is "good" or "bad."
+5. If asked about adjustments, respond: "I can describe what your numbers currently show, but for allocation decisions please consult a licensed financial adviser."
+6. Keep answers under 250 words.
+--- END CONTEXT ---`;
+}
+
+// ---------- BUILD SYSTEM PROMPT (router) ----------
+function buildSystemPrompt(context) {
+  if (!context) return BASE_SYSTEM_PROMPT;
+  if (context.type === 'portfolio' && Array.isArray(context.holdings)) {
+    return buildPortfolioPrompt(context);
+  }
+  if (context.symbol) return buildStockPrompt(context);
+  return BASE_SYSTEM_PROMPT;
 }
 
 // ---------- RATE LIMITER ----------
@@ -120,7 +178,8 @@ router.post('/', async (req, res) => {
   }));
 
   const systemPrompt = buildSystemPrompt(context);
-  if (context?.symbol) console.log(`📊 Chat context: ${context.symbol}`);
+  if (context?.type === 'portfolio') console.log(`💼 Chat context: PORTFOLIO (${context.holdings?.length || 0} holdings)`);
+  else if (context?.symbol) console.log(`📊 Chat context: ${context.symbol}`);
 
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
@@ -128,8 +187,8 @@ router.post('/', async (req, res) => {
 
     const payload = {
       messages: [{ role: 'system', content: systemPrompt }, ...recentMessages],
-      max_tokens: 500,
-      temperature: 0.5,
+      max_tokens: 600,
+      temperature: 0.4,
     };
 
     const headers = {
