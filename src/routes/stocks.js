@@ -120,9 +120,10 @@ router.get('/search', limiter, async (req, res) => {
   }
 });
 
-// ✅ UPDATED: Historical Long-Term Growth ($1,000 invested)
-// - Fetches 35 years of data ONCE (safety buffer for leap years + edge cases)
-// - Returns null for periods where the stock didn't exist yet
+// ✅ UPDATED: Historical Long-Term Growth with Since Listing support
+// - Periods: 1, 5, 10, 15, 20, 25, 30 years
+// - Uses "Since Listing" for the first slot where data doesn't reach far enough
+// - Returns dynamic labels + null for slots beyond the listing date
 router.get('/long-term-growth', limiter, async (req, res) => {
   let symbol = String(req.query.symbol || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -142,33 +143,49 @@ router.get('/long-term-growth', limiter, async (req, res) => {
     const { timestamps, closes } = await fetchPricesRaw(symbol, thirtyFiveYearsAgo);
     const { dividends } = await fetchDividendsRaw(symbol, market);
 
-    // 3. Determine the earliest available data point
+    // 3. Earliest available data point
     const earliestEpoch = timestamps.length > 0 ? timestamps[0] : null;
 
-    const periods = [1, 5, 10, 20, 30];
+    // 4. Periods to compute
+    const periods = [1, 5, 10, 15, 20, 25, 30];
+    const labels = [];
     const noDrip = [];
     const drip = [];
+    let sinceListingUsed = false;
 
     for (const yearsAgo of periods) {
       const startDate = new Date();
       startDate.setFullYear(startDate.getFullYear() - yearsAgo);
       const startEpoch = Math.floor(startDate.getTime() / 1000);
 
-      // ✅ If the stock didn't exist yet, return null for this period
+      let effectiveEpoch = startEpoch;
+      let isSinceListing = false;
+
+      // If the stock didn't exist that far back:
+      //   - Use "Since Listing" once (earliest available data)
+      //   - Mark subsequent slots as null
       if (!earliestEpoch || earliestEpoch > startEpoch) {
-        noDrip.push(null);
-        drip.push(null);
-        continue;
+        if (!sinceListingUsed && earliestEpoch) {
+          effectiveEpoch = earliestEpoch;
+          isSinceListing = true;
+          sinceListingUsed = true;
+        } else {
+          labels.push(null);
+          noDrip.push(null);
+          drip.push(null);
+          continue;
+        }
       }
 
-      // Find price on or before startEpoch
+      // Find price at or before effectiveEpoch
       let buyPrice = null;
       for (let i = 0; i < timestamps.length; i++) {
-        if (timestamps[i] <= startEpoch) buyPrice = closes[i];
+        if (timestamps[i] <= effectiveEpoch) buyPrice = closes[i];
         else break;
       }
 
       if (!buyPrice) {
+        labels.push(null);
         noDrip.push(null);
         drip.push(null);
         continue;
@@ -177,9 +194,9 @@ router.get('/long-term-growth', limiter, async (req, res) => {
       const sharesPurchased = amount / buyPrice;
       const noDripValue = sharesPurchased * currentPrice;
 
-      // Simulate DRIP (Reinvest dividends at next trading day's close)
+      // Simulate DRIP
       let simulatedShares = sharesPurchased;
-      const divs = dividends.filter(d => d.epoch > startEpoch);
+      const divs = dividends.filter(d => d.epoch > effectiveEpoch);
       for (const d of divs) {
         const cashFromDiv = simulatedShares * d.amount;
         let reinvestPrice = null;
@@ -195,12 +212,15 @@ router.get('/long-term-growth', limiter, async (req, res) => {
       }
 
       const dripValue = simulatedShares * currentPrice;
+
+      labels.push(isSinceListing ? 'Since Listing' : `${yearsAgo}Y Ago`);
       noDrip.push(Math.round(noDripValue * 100) / 100);
       drip.push(Math.round(dripValue * 100) / 100);
     }
 
     res.json({
       currencySymbol: market === 'sg' ? 'S$' : '$',
+      labels,
       noDrip,
       drip
     });
