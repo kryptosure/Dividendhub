@@ -1,5 +1,5 @@
 /* backend/src/routes/chat.js
- * AI chat proxy with rate limiting and compliance guardrails.
+ * AI chat proxy with rate limiting, compliance guardrails, and model fallback.
  */
 
 const express = require('express');
@@ -12,7 +12,13 @@ const router = express.Router();
 const DAILY_LIMIT = 10;      // per user
 const MINUTE_LIMIT = 5;      // per user
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const MODEL = 'deepseek/deepseek-chat-v3-0324:free';
+
+// ✅ Model fallback chain — if primary fails, try the next one
+const MODELS = [
+  'deepseek/deepseek-r1:free',
+  'qwen/qwen3.6-plus-preview:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+];
 
 // ---------- SYSTEM PROMPT (compliance guardrails) ----------
 const SYSTEM_PROMPT = `You are DividendBro AI, an educational assistant for dividend investing on dividendbro.com.
@@ -99,38 +105,55 @@ router.post('/', async (req, res) => {
     content: String(m.content || '').slice(0, 2000),
   }));
 
-  // 4. Call OpenRouter
+  // 4. Call OpenRouter with model fallback
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       return res.status(500).json({ error: 'AI service not configured' });
     }
 
-    const response = await axios.post(
-      OPENROUTER_URL,
-      {
-        model: MODEL,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          ...recentMessages,
-        ],
-        max_tokens: 500,
-        temperature: 0.5,
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://dividendbro.com',
-          'X-Title': 'DividendBro AI',
-        },
-        timeout: 30000,
-      }
-    );
+    const payload = {
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...recentMessages,
+      ],
+      max_tokens: 500,
+      temperature: 0.5,
+    };
 
-    const aiMessage = response.data?.choices?.[0]?.message?.content;
+    const headers = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://dividendbro.com',
+      'X-Title': 'DividendBro AI',
+    };
+
+    let aiMessage = null;
+    let lastError = null;
+
+    // Try each model in the fallback chain
+    for (const model of MODELS) {
+      try {
+        console.log(`🤖 Trying model: ${model}`);
+        const response = await axios.post(
+          OPENROUTER_URL,
+          { ...payload, model },
+          { headers, timeout: 30000 }
+        );
+        aiMessage = response.data?.choices?.[0]?.message?.content;
+        if (aiMessage) {
+          console.log(`✅ Success with ${model}`);
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+        console.warn(`❌ Model ${model} failed:`, err.response?.data?.error?.message || err.message);
+        // Continue to next model
+      }
+    }
+
     if (!aiMessage) {
-      return res.status(502).json({ error: 'No response from AI service' });
+      throw lastError || new Error('All AI models failed');
     }
 
     res.json({ reply: aiMessage });
