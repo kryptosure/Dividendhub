@@ -15,7 +15,6 @@ function getFirstTradingDay(timestamps, year, month) {
   return null;
 }
 
-// Helper: price at or before
 function findPriceAtOrBefore(timestamps, closes, targetEpoch) {
   let idx = -1;
   for (let i = 0; i < timestamps.length; i++) {
@@ -26,7 +25,6 @@ function findPriceAtOrBefore(timestamps, closes, targetEpoch) {
   return { price: closes[idx], epoch: timestamps[idx] };
 }
 
-// Helper: next price after
 function findNextPrice(timestamps, closes, targetEpoch) {
   for (let i = 0; i < timestamps.length; i++) {
     if (timestamps[i] > targetEpoch && closes[i] != null) {
@@ -36,6 +34,7 @@ function findNextPrice(timestamps, closes, targetEpoch) {
   return null;
 }
 
+// ---------- Existing DCA route ----------
 router.get('/dca', async (req, res) => {
   let symbol = String(req.query.ticker || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -63,7 +62,6 @@ router.get('/dca', async (req, res) => {
     const { timestamps, closes } = await fetchPricesRaw(symbol, startEpoch - 30 * 86400);
     const splits = await fetchSplitsRaw(symbol);
 
-    // Schedule: first trading day each month
     const schedule = [];
     let currentDate = new Date(startDate);
     currentDate.setUTCDate(1);
@@ -90,7 +88,6 @@ router.get('/dca', async (req, res) => {
       return res.status(422).json({ error: 'No trading days found.' });
     }
 
-    // Combine events (investments + dividends) – NO splits applied
     const events = [];
     for (const inv of schedule) events.push({ epoch: inv.epoch, type: 'invest', data: inv });
     for (const d of dividends) events.push({ epoch: d.epoch, type: 'dividend', amount: d.amount });
@@ -163,6 +160,95 @@ router.get('/dca', async (req, res) => {
   } catch (e) {
     console.error('DCA simulation error:', e);
     res.status(422).json({ error: e.message });
+  }
+});
+
+// ✅ NEW: Millionaire Simulator - returns stock metrics for client-side projection
+router.get('/millionaire/:symbol', async (req, res) => {
+  let symbol = String(req.params.symbol || '').trim().toUpperCase();
+  const market = String(req.query.market || 'us').toLowerCase();
+
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+  if (market === 'sg' && !symbol.endsWith('.SI')) symbol += '.SI';
+
+  try {
+    // 1. Current price + 5 years of history in one call
+    const nowEpoch = Math.floor(Date.now() / 1000);
+    const fiveYearsAgo = nowEpoch - (5 * 365 * 86400);
+    const { meta, timestamps, closes } = await fetchPricesRaw(symbol, fiveYearsAgo);
+
+    let currentPrice = meta.regularMarketPrice;
+    if (!currentPrice || isNaN(currentPrice)) {
+      // Fallback to latest close
+      for (let i = closes.length - 1; i >= 0; i--) {
+        if (closes[i] != null) { currentPrice = closes[i]; break; }
+      }
+    }
+    if (!currentPrice) throw new Error('Could not determine current price');
+
+    // 2. Compute 5Y price CAGR
+    let priceCAGR = 0;
+    if (timestamps.length > 0 && closes.length > 0) {
+      // Find price ~5 years ago (earliest available)
+      let earliestPrice = null;
+      for (let i = 0; i < closes.length; i++) {
+        if (closes[i] != null) { earliestPrice = closes[i]; break; }
+      }
+      if (earliestPrice && earliestPrice > 0) {
+        const yearsElapsed = (timestamps[timestamps.length - 1] - timestamps[0]) / (365 * 86400);
+        if (yearsElapsed >= 1) {
+          priceCAGR = Math.pow(currentPrice / earliestPrice, 1 / yearsElapsed) - 1;
+          // Clamp to reasonable range (-10% to +30%) to avoid outliers
+          priceCAGR = Math.max(-0.10, Math.min(0.30, priceCAGR));
+        }
+      }
+    }
+
+    // 3. Current yield and dividend CAGR
+    const { dividends } = await fetchDividendsRaw(symbol, market);
+
+    let currentYield = 0;
+    let dividendCAGR = 0;
+
+    if (dividends.length > 0) {
+      const oneYearAgo = nowEpoch - (365 * 86400);
+      const recentDivs = dividends.filter(d => d.epoch > oneYearAgo);
+      const trailingAnnualDiv = recentDivs.reduce((sum, d) => sum + d.amount, 0);
+      currentYield = currentPrice > 0 ? (trailingAnnualDiv / currentPrice) : 0;
+      currentYield = Math.max(0, Math.min(0.20, currentYield)); // clamp 0-20%
+
+      // Dividend CAGR over available history (up to 5y)
+      const byYear = {};
+      for (const d of dividends) {
+        const y = new Date(d.epoch * 1000).getUTCFullYear();
+        byYear[y] = (byYear[y] || 0) + d.amount;
+      }
+      const years = Object.keys(byYear).map(Number).sort((a, b) => a - b);
+      if (years.length >= 2) {
+        const latest = years[years.length - 1];
+        const targetYear = Math.max(years[0], latest - 5);
+        const startTotal = byYear[targetYear];
+        const endTotal = byYear[latest];
+        if (startTotal > 0 && endTotal > 0 && latest > targetYear) {
+          dividendCAGR = Math.pow(endTotal / startTotal, 1 / (latest - targetYear)) - 1;
+          dividendCAGR = Math.max(-0.10, Math.min(0.20, dividendCAGR)); // clamp
+        }
+      }
+    }
+
+    res.json({
+      symbol,
+      name: meta.longName || meta.shortName || symbol,
+      currencySymbol: market === 'sg' ? 'S$' : '$',
+      currentPrice: round2(currentPrice),
+      currentYield: Math.round(currentYield * 10000) / 10000,
+      priceCAGR: Math.round(priceCAGR * 10000) / 10000,
+      dividendCAGR: Math.round(dividendCAGR * 10000) / 10000,
+    });
+
+  } catch (e) {
+    console.error('Millionaire simulator error:', e);
+    res.status(422).json({ error: e.message || 'Failed to fetch stock metrics' });
   }
 });
 
