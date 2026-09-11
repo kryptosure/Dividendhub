@@ -33,6 +33,8 @@ app.use('/api/historical-price', require('./routes/historicalPrice'));
 
 // ✅ NEW: AI Chat proxy
 app.use('/api/chat', require('./routes/chat'));
+app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/events', require('./routes/events'));   // ← NEW
 
 // ---------- NEW: /api/search endpoint ----------
 // Fallback map for common names (as a last resort)
