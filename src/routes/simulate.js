@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
+const Stock = require('../models/stock');
 const { fetchDividendsRaw, fetchPricesRaw, fetchSplitsRaw } = require('../services/yahooFinance');
 const { round2, pct, isoOf } = require('../utils/helpers');
 
-// Helper: first trading day of month
+// ============ HELPERS ============
 function getFirstTradingDay(timestamps, year, month) {
   const monthStart = new Date(Date.UTC(year, month - 1, 1));
   const monthEnd = new Date(Date.UTC(year, month, 0));
@@ -34,7 +35,82 @@ function findNextPrice(timestamps, closes, targetEpoch) {
   return null;
 }
 
-// ---------- Existing DCA route ----------
+// ============ MILLIONAIRE METRICS (reusable) ============
+async function getMillionaireMetrics(symbol, market) {
+  let cleanSymbol = String(symbol || '').trim().toUpperCase();
+  if (!cleanSymbol) throw new Error('symbol required');
+  if (market === 'sg' && !cleanSymbol.endsWith('.SI')) cleanSymbol += '.SI';
+
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  const fiveYearsAgo = nowEpoch - (5 * 365 * 86400);
+  const { meta, timestamps, closes } = await fetchPricesRaw(cleanSymbol, fiveYearsAgo);
+
+  let currentPrice = meta.regularMarketPrice;
+  if (!currentPrice || isNaN(currentPrice)) {
+    for (let i = closes.length - 1; i >= 0; i--) {
+      if (closes[i] != null) { currentPrice = closes[i]; break; }
+    }
+  }
+  if (!currentPrice) throw new Error('Could not determine current price');
+
+  // Compute 5Y price CAGR
+  let priceCAGR = 0;
+  if (timestamps.length > 0 && closes.length > 0) {
+    let earliestPrice = null;
+    for (let i = 0; i < closes.length; i++) {
+      if (closes[i] != null) { earliestPrice = closes[i]; break; }
+    }
+    if (earliestPrice && earliestPrice > 0) {
+      const yearsElapsed = (timestamps[timestamps.length - 1] - timestamps[0]) / (365 * 86400);
+      if (yearsElapsed >= 1) {
+        priceCAGR = Math.pow(currentPrice / earliestPrice, 1 / yearsElapsed) - 1;
+        priceCAGR = Math.max(-0.10, Math.min(0.30, priceCAGR));
+      }
+    }
+  }
+
+  // Yield & dividend CAGR
+  const { dividends } = await fetchDividendsRaw(cleanSymbol, market);
+  let currentYield = 0;
+  let dividendCAGR = 0;
+
+  if (dividends.length > 0) {
+    const oneYearAgo = nowEpoch - (365 * 86400);
+    const recentDivs = dividends.filter(d => d.epoch > oneYearAgo);
+    const trailingAnnualDiv = recentDivs.reduce((sum, d) => sum + d.amount, 0);
+    currentYield = currentPrice > 0 ? (trailingAnnualDiv / currentPrice) : 0;
+    currentYield = Math.max(0, Math.min(0.20, currentYield));
+
+    const byYear = {};
+    for (const d of dividends) {
+      const y = new Date(d.epoch * 1000).getUTCFullYear();
+      byYear[y] = (byYear[y] || 0) + d.amount;
+    }
+    const years = Object.keys(byYear).map(Number).sort((a, b) => a - b);
+    if (years.length >= 2) {
+      const latest = years[years.length - 1];
+      const targetYear = Math.max(years[0], latest - 5);
+      const startTotal = byYear[targetYear];
+      const endTotal = byYear[latest];
+      if (startTotal > 0 && endTotal > 0 && latest > targetYear) {
+        dividendCAGR = Math.pow(endTotal / startTotal, 1 / (latest - targetYear)) - 1;
+        dividendCAGR = Math.max(-0.10, Math.min(0.20, dividendCAGR));
+      }
+    }
+  }
+
+  return {
+    symbol: cleanSymbol,
+    name: meta.longName || meta.shortName || cleanSymbol,
+    currencySymbol: market === 'sg' ? 'S$' : '$',
+    currentPrice: round2(currentPrice),
+    currentYield: Math.round(currentYield * 10000) / 10000,
+    priceCAGR: Math.round(priceCAGR * 10000) / 10000,
+    dividendCAGR: Math.round(dividendCAGR * 10000) / 10000,
+  };
+}
+
+// ============ DCA ROUTE (unchanged) ============
 router.get('/dca', async (req, res) => {
   let symbol = String(req.query.ticker || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -163,92 +239,65 @@ router.get('/dca', async (req, res) => {
   }
 });
 
-// ✅ NEW: Millionaire Simulator - returns stock metrics for client-side projection
+// ============ MILLIONAIRE (single stock) ============
 router.get('/millionaire/:symbol', async (req, res) => {
-  let symbol = String(req.params.symbol || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
-
-  if (!symbol) return res.status(400).json({ error: 'symbol required' });
-  if (market === 'sg' && !symbol.endsWith('.SI')) symbol += '.SI';
-
   try {
-    // 1. Current price + 5 years of history in one call
-    const nowEpoch = Math.floor(Date.now() / 1000);
-    const fiveYearsAgo = nowEpoch - (5 * 365 * 86400);
-    const { meta, timestamps, closes } = await fetchPricesRaw(symbol, fiveYearsAgo);
-
-    let currentPrice = meta.regularMarketPrice;
-    if (!currentPrice || isNaN(currentPrice)) {
-      // Fallback to latest close
-      for (let i = closes.length - 1; i >= 0; i--) {
-        if (closes[i] != null) { currentPrice = closes[i]; break; }
-      }
-    }
-    if (!currentPrice) throw new Error('Could not determine current price');
-
-    // 2. Compute 5Y price CAGR
-    let priceCAGR = 0;
-    if (timestamps.length > 0 && closes.length > 0) {
-      // Find price ~5 years ago (earliest available)
-      let earliestPrice = null;
-      for (let i = 0; i < closes.length; i++) {
-        if (closes[i] != null) { earliestPrice = closes[i]; break; }
-      }
-      if (earliestPrice && earliestPrice > 0) {
-        const yearsElapsed = (timestamps[timestamps.length - 1] - timestamps[0]) / (365 * 86400);
-        if (yearsElapsed >= 1) {
-          priceCAGR = Math.pow(currentPrice / earliestPrice, 1 / yearsElapsed) - 1;
-          // Clamp to reasonable range (-10% to +30%) to avoid outliers
-          priceCAGR = Math.max(-0.10, Math.min(0.30, priceCAGR));
-        }
-      }
-    }
-
-    // 3. Current yield and dividend CAGR
-    const { dividends } = await fetchDividendsRaw(symbol, market);
-
-    let currentYield = 0;
-    let dividendCAGR = 0;
-
-    if (dividends.length > 0) {
-      const oneYearAgo = nowEpoch - (365 * 86400);
-      const recentDivs = dividends.filter(d => d.epoch > oneYearAgo);
-      const trailingAnnualDiv = recentDivs.reduce((sum, d) => sum + d.amount, 0);
-      currentYield = currentPrice > 0 ? (trailingAnnualDiv / currentPrice) : 0;
-      currentYield = Math.max(0, Math.min(0.20, currentYield)); // clamp 0-20%
-
-      // Dividend CAGR over available history (up to 5y)
-      const byYear = {};
-      for (const d of dividends) {
-        const y = new Date(d.epoch * 1000).getUTCFullYear();
-        byYear[y] = (byYear[y] || 0) + d.amount;
-      }
-      const years = Object.keys(byYear).map(Number).sort((a, b) => a - b);
-      if (years.length >= 2) {
-        const latest = years[years.length - 1];
-        const targetYear = Math.max(years[0], latest - 5);
-        const startTotal = byYear[targetYear];
-        const endTotal = byYear[latest];
-        if (startTotal > 0 && endTotal > 0 && latest > targetYear) {
-          dividendCAGR = Math.pow(endTotal / startTotal, 1 / (latest - targetYear)) - 1;
-          dividendCAGR = Math.max(-0.10, Math.min(0.20, dividendCAGR)); // clamp
-        }
-      }
-    }
-
-    res.json({
-      symbol,
-      name: meta.longName || meta.shortName || symbol,
-      currencySymbol: market === 'sg' ? 'S$' : '$',
-      currentPrice: round2(currentPrice),
-      currentYield: Math.round(currentYield * 10000) / 10000,
-      priceCAGR: Math.round(priceCAGR * 10000) / 10000,
-      dividendCAGR: Math.round(dividendCAGR * 10000) / 10000,
-    });
-
+    const data = await getMillionaireMetrics(req.params.symbol, market);
+    res.json(data);
   } catch (e) {
     console.error('Millionaire simulator error:', e);
     res.status(422).json({ error: e.message || 'Failed to fetch stock metrics' });
+  }
+});
+
+// ============ MILLIONAIRE LEADERBOARD ============
+// In-memory cache (5 min) so we don't slam Yahoo
+const leaderboardCache = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+router.get('/millionaire-leaderboard/:market', async (req, res) => {
+  const market = String(req.params.market || 'us').toLowerCase();
+  const cacheKey = market;
+  const cached = leaderboardCache.get(cacheKey);
+
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
+    console.log(`📦 Leaderboard cache hit for ${market}`);
+    return res.json(cached.data);
+  }
+
+  try {
+    // 1. Get top stocks from DB, ordered by yield
+    const topStocks = await Stock.findAll({
+      where: { market },
+      order: [['currentYield', 'DESC']],
+      limit: 15,
+      attributes: ['symbol', 'name'],
+    });
+
+    if (topStocks.length === 0) {
+      return res.json({ stocks: [], market });
+    }
+
+    // 2. Fetch metrics for each in parallel (with settle so one failure doesn't kill all)
+    const results = await Promise.allSettled(
+      topStocks.map(s => getMillionaireMetrics(s.symbol, market))
+    );
+
+    const stocks = results
+      .filter(r => r.status === 'fulfilled' && r.value && r.value.currentPrice > 0)
+      .map(r => r.value);
+
+    const payload = { stocks, market, generatedAt: new Date().toISOString() };
+
+    // 3. Cache
+    leaderboardCache.set(cacheKey, { timestamp: Date.now(), data: payload });
+
+    console.log(`✅ Leaderboard generated for ${market}: ${stocks.length} stocks`);
+    res.json(payload);
+  } catch (e) {
+    console.error('Leaderboard error:', e);
+    res.status(500).json({ error: 'Failed to generate leaderboard' });
   }
 });
 
