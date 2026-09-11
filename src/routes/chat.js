@@ -1,5 +1,5 @@
 /* backend/src/routes/chat.js
- * AI chat proxy with rate limiting, compliance guardrails, and model fallback.
+ * AI chat proxy with rate limiting, compliance guardrails, and intelligent model routing.
  */
 
 const express = require('express');
@@ -13,11 +13,16 @@ const DAILY_LIMIT = 10;      // per user
 const MINUTE_LIMIT = 5;      // per user
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-// ✅ Model fallback chain — if primary fails, try the next one
-const MODELS = [
-  'deepseek/deepseek-r1:free',
-  'qwen/qwen3.6-plus-preview:free',
-  'meta-llama/llama-3.3-70b-instruct:free',
+// ✅ Use the Auto Router with a 'low' cost tier to get the best free/cheap model
+const PRIMARY_MODEL = 'openrouter/auto';
+const COST_TIER = 'low';
+
+// Manual fallback chain in case the Auto Router is unavailable
+const FALLBACK_MODELS = [
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'z-ai/glm-5.2:free',
+  'minimax/minimax-m3:free',
+  'google/gemma-4-31b-it:free',
 ];
 
 // ---------- SYSTEM PROMPT (compliance guardrails) ----------
@@ -99,27 +104,17 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  // Cap conversation to last 10 messages and 2000 chars each
   const recentMessages = messages.slice(-10).map(m => ({
     role: m.role === 'user' ? 'user' : 'assistant',
     content: String(m.content || '').slice(0, 2000),
   }));
 
-  // 4. Call OpenRouter with model fallback
+  // 4. Call OpenRouter
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       return res.status(500).json({ error: 'AI service not configured' });
     }
-
-    const payload = {
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...recentMessages,
-      ],
-      max_tokens: 500,
-      temperature: 0.5,
-    };
 
     const headers = {
       'Authorization': `Bearer ${apiKey}`,
@@ -128,27 +123,60 @@ router.post('/', async (req, res) => {
       'X-Title': 'DividendBro AI',
     };
 
+    const basePayload = {
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...recentMessages,
+      ],
+      max_tokens: 500,
+      temperature: 0.5,
+    };
+
     let aiMessage = null;
     let lastError = null;
 
-    // Try each model in the fallback chain
-    for (const model of MODELS) {
-      try {
-        console.log(`🤖 Trying model: ${model}`);
-        const response = await axios.post(
-          OPENROUTER_URL,
-          { ...payload, model },
-          { headers, timeout: 30000 }
-        );
-        aiMessage = response.data?.choices?.[0]?.message?.content;
-        if (aiMessage) {
-          console.log(`✅ Success with ${model}`);
-          break;
+    // --- Step 1: Try the Auto Router with cost_tier 'low' ---
+    try {
+      console.log(`🤖 Trying Auto Router with cost_tier: ${COST_TIER}`);
+      const response = await axios.post(
+        OPENROUTER_URL,
+        {
+          ...basePayload,
+          model: PRIMARY_MODEL,
+          plugins: [{ id: 'auto-router', cost_tier: COST_TIER }],
+        },
+        { headers, timeout: 45000 }
+      );
+      aiMessage = response.data?.choices?.[0]?.message?.content;
+      if (aiMessage) {
+        console.log(`✅ Success with Auto Router (cost_tier: ${COST_TIER})`);
+        const usedModel = response.data?.model || 'unknown';
+        console.log(`   Model chosen by router: ${usedModel}`);
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`❌ Auto Router failed:`, err.response?.data?.error?.message || err.message);
+    }
+
+    // --- Step 2: If Auto Router fails, try manual free fallbacks ---
+    if (!aiMessage) {
+      for (const model of FALLBACK_MODELS) {
+        try {
+          console.log(`🤖 Trying fallback model: ${model}`);
+          const response = await axios.post(
+            OPENROUTER_URL,
+            { ...basePayload, model },
+            { headers, timeout: 30000 }
+          );
+          aiMessage = response.data?.choices?.[0]?.message?.content;
+          if (aiMessage) {
+            console.log(`✅ Success with fallback: ${model}`);
+            break;
+          }
+        } catch (err) {
+          lastError = err;
+          console.warn(`❌ Fallback ${model} failed:`, err.response?.data?.error?.message || err.message);
         }
-      } catch (err) {
-        lastError = err;
-        console.warn(`❌ Model ${model} failed:`, err.response?.data?.error?.message || err.message);
-        // Continue to next model
       }
     }
 
