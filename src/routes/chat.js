@@ -1,5 +1,5 @@
 /* backend/src/routes/chat.js
- * AI chat proxy with rate limiting, compliance guardrails, and intelligent model routing.
+ * AI chat proxy with rate limiting, compliance guardrails, and model fallback.
  */
 
 const express = require('express');
@@ -9,23 +9,19 @@ const jwt = require('jsonwebtoken');
 const router = express.Router();
 
 // ---------- CONFIG ----------
-const DAILY_LIMIT = 10;      // per user
-const MINUTE_LIMIT = 5;      // per user
+const DAILY_LIMIT = 10;
+const MINUTE_LIMIT = 5;
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-// ✅ Use the Auto Router with a 'low' cost tier to get the best free/cheap model
-const PRIMARY_MODEL = 'openrouter/auto';
-const COST_TIER = 'low';
-
-// Manual fallback chain in case the Auto Router is unavailable
-const FALLBACK_MODELS = [
+// Model fallback chain — tried in order until one succeeds
+const MODELS = [
   'nvidia/nemotron-3-super-120b-a12b:free',
   'z-ai/glm-5.2:free',
   'minimax/minimax-m3:free',
   'google/gemma-4-31b-it:free',
 ];
 
-// ---------- SYSTEM PROMPT (compliance guardrails) ----------
+// ---------- SYSTEM PROMPT ----------
 const SYSTEM_PROMPT = `You are DividendBro AI, an educational assistant for dividend investing on dividendbro.com.
 
 STRICT RULES — you must follow these at all times:
@@ -50,18 +46,10 @@ function checkRateLimit(key) {
   const day = now.toISOString().slice(0, 10);
   const minute = now.toISOString().slice(0, 16);
 
-  const record = userRateLimits.get(key) || {
-    day: '', count: 0, minute: '', minuteCount: 0,
-  };
+  const record = userRateLimits.get(key) || { day: '', count: 0, minute: '', minuteCount: 0 };
 
-  if (record.day !== day) {
-    record.day = day;
-    record.count = 0;
-  }
-  if (record.minute !== minute) {
-    record.minute = minute;
-    record.minuteCount = 0;
-  }
+  if (record.day !== day) { record.day = day; record.count = 0; }
+  if (record.minute !== minute) { record.minute = minute; record.minuteCount = 0; }
 
   if (record.count >= DAILY_LIMIT) {
     return { allowed: false, reason: `Daily limit of ${DAILY_LIMIT} messages reached. Please come back tomorrow.` };
@@ -78,7 +66,6 @@ function checkRateLimit(key) {
 
 // ---------- CHAT ENDPOINT ----------
 router.post('/', async (req, res) => {
-  // 1. Optional authentication
   let userEmail = null;
   const authHeader = req.headers.authorization;
   if (authHeader) {
@@ -86,19 +73,15 @@ router.post('/', async (req, res) => {
       const token = authHeader.split(' ')[1];
       const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
       userEmail = decoded.email;
-    } catch (e) {
-      // Invalid token — treat as anonymous
-    }
+    } catch (e) {}
   }
 
-  // 2. Rate limit
   const limitKey = userEmail || req.ip;
   const rateCheck = checkRateLimit(limitKey);
   if (!rateCheck.allowed) {
     return res.status(429).json({ error: rateCheck.reason });
   }
 
-  // 3. Validate input
   const { messages } = req.body;
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'messages array required' });
@@ -109,12 +92,15 @@ router.post('/', async (req, res) => {
     content: String(m.content || '').slice(0, 2000),
   }));
 
-  // 4. Call OpenRouter
   try {
     const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: 'AI service not configured' });
-    }
+    if (!apiKey) return res.status(500).json({ error: 'AI service not configured' });
+
+    const payload = {
+      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...recentMessages],
+      max_tokens: 500,
+      temperature: 0.5,
+    };
 
     const headers = {
       'Authorization': `Bearer ${apiKey}`,
@@ -123,72 +109,34 @@ router.post('/', async (req, res) => {
       'X-Title': 'DividendBro AI',
     };
 
-    const basePayload = {
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...recentMessages,
-      ],
-      max_tokens: 500,
-      temperature: 0.5,
-    };
-
     let aiMessage = null;
     let lastError = null;
 
-    // --- Step 1: Try the Auto Router with cost_tier 'low' ---
-    try {
-      console.log(`🤖 Trying Auto Router with cost_tier: ${COST_TIER}`);
-      const response = await axios.post(
-        OPENROUTER_URL,
-        {
-          ...basePayload,
-          model: PRIMARY_MODEL,
-          plugins: [{ id: 'auto-router', cost_tier: COST_TIER }],
-        },
-        { headers, timeout: 45000 }
-      );
-      aiMessage = response.data?.choices?.[0]?.message?.content;
-      if (aiMessage) {
-        console.log(`✅ Success with Auto Router (cost_tier: ${COST_TIER})`);
-        const usedModel = response.data?.model || 'unknown';
-        console.log(`   Model chosen by router: ${usedModel}`);
-      }
-    } catch (err) {
-      lastError = err;
-      console.warn(`❌ Auto Router failed:`, err.response?.data?.error?.message || err.message);
-    }
-
-    // --- Step 2: If Auto Router fails, try manual free fallbacks ---
-    if (!aiMessage) {
-      for (const model of FALLBACK_MODELS) {
-        try {
-          console.log(`🤖 Trying fallback model: ${model}`);
-          const response = await axios.post(
-            OPENROUTER_URL,
-            { ...basePayload, model },
-            { headers, timeout: 30000 }
-          );
-          aiMessage = response.data?.choices?.[0]?.message?.content;
-          if (aiMessage) {
-            console.log(`✅ Success with fallback: ${model}`);
-            break;
-          }
-        } catch (err) {
-          lastError = err;
-          console.warn(`❌ Fallback ${model} failed:`, err.response?.data?.error?.message || err.message);
+    for (const model of MODELS) {
+      try {
+        console.log(`🤖 Trying: ${model}`);
+        const response = await axios.post(
+          OPENROUTER_URL,
+          { ...payload, model },
+          { headers, timeout: 30000 }
+        );
+        aiMessage = response.data?.choices?.[0]?.message?.content;
+        if (aiMessage) {
+          console.log(`✅ Success: ${model}`);
+          break;
         }
+      } catch (err) {
+        lastError = err;
+        console.warn(`❌ Failed ${model}:`, err.response?.data?.error?.message || err.message);
       }
     }
 
-    if (!aiMessage) {
-      throw lastError || new Error('All AI models failed');
-    }
-
+    if (!aiMessage) throw lastError || new Error('All AI models failed');
     res.json({ reply: aiMessage });
   } catch (err) {
     console.error('Chat AI error:', err.response?.data || err.message);
     const status = err.response?.status || 500;
-    const message = err.response?.data?.error?.message || 'AI service temporarily unavailable. Please try again.';
+    const message = err.response?.data?.error?.message || 'AI service temporarily unavailable.';
     res.status(status).json({ error: message });
   }
 });
