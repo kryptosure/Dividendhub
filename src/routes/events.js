@@ -9,6 +9,7 @@ const Event = require('../models/Event');
 
 // Whitelist of event types we accept
 const ALLOWED_EVENTS = new Set([
+  // Existing events
   'search',
   'view_stock',
   'add_portfolio',
@@ -30,6 +31,15 @@ const ALLOWED_EVENTS = new Set([
   'open_watchlist',
   'toggle_theme',
   'toggle_market',
+  // ✅ NEW: Millionaire Simulator events
+  'open_millionaire_simulator',
+  'millionaire_autocomplete_select',
+  'millionaire_select_from_leaderboard',
+  'millionaire_select_from_history',
+  'millionaire_share_download',
+  'millionaire_share_tweet',
+  'millionaire_share_copy',
+  'millionaire_share_whatsapp',
 ]);
 
 router.post('/', async (req, res) => {
