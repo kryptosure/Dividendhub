@@ -36,6 +36,10 @@ function findNextPrice(timestamps, closes, targetEpoch) {
 }
 
 // ============ MILLIONAIRE METRICS (reusable) ============
+// ✅ UPDATED: More realistic CAGR caps for long-term projections
+const PRICE_CAGR_CAP = 0.18;    // 18% max — even best stocks rarely sustain higher
+const DIV_CAGR_CAP = 0.12;      // 12% max — aggressive but achievable for best dividend growers
+
 async function getMillionaireMetrics(symbol, market) {
   let cleanSymbol = String(symbol || '').trim().toUpperCase();
   if (!cleanSymbol) throw new Error('symbol required');
@@ -64,7 +68,8 @@ async function getMillionaireMetrics(symbol, market) {
       const yearsElapsed = (timestamps[timestamps.length - 1] - timestamps[0]) / (365 * 86400);
       if (yearsElapsed >= 1) {
         priceCAGR = Math.pow(currentPrice / earliestPrice, 1 / yearsElapsed) - 1;
-        priceCAGR = Math.max(-0.10, Math.min(0.30, priceCAGR));
+        // ✅ UPDATED: More realistic cap
+        priceCAGR = Math.max(-0.10, Math.min(PRICE_CAGR_CAP, priceCAGR));
       }
     }
   }
@@ -94,7 +99,8 @@ async function getMillionaireMetrics(symbol, market) {
       const endTotal = byYear[latest];
       if (startTotal > 0 && endTotal > 0 && latest > targetYear) {
         dividendCAGR = Math.pow(endTotal / startTotal, 1 / (latest - targetYear)) - 1;
-        dividendCAGR = Math.max(-0.10, Math.min(0.20, dividendCAGR));
+        // ✅ UPDATED: More realistic cap (down from 20%)
+        dividendCAGR = Math.max(-0.10, Math.min(DIV_CAGR_CAP, dividendCAGR));
       }
     }
   }
@@ -252,7 +258,6 @@ router.get('/millionaire/:symbol', async (req, res) => {
 });
 
 // ============ MILLIONAIRE LEADERBOARD ============
-// In-memory cache (5 min) so we don't slam Yahoo
 const leaderboardCache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -267,7 +272,6 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
   }
 
   try {
-    // 1. Get top stocks from DB, ordered by yield
     const topStocks = await Stock.findAll({
       where: { market },
       order: [['currentYield', 'DESC']],
@@ -279,7 +283,6 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
       return res.json({ stocks: [], market });
     }
 
-    // 2. Fetch metrics for each in parallel (with settle so one failure doesn't kill all)
     const results = await Promise.allSettled(
       topStocks.map(s => getMillionaireMetrics(s.symbol, market))
     );
@@ -290,7 +293,6 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
 
     const payload = { stocks, market, generatedAt: new Date().toISOString() };
 
-    // 3. Cache
     leaderboardCache.set(cacheKey, { timestamp: Date.now(), data: payload });
 
     console.log(`✅ Leaderboard generated for ${market}: ${stocks.length} stocks`);
