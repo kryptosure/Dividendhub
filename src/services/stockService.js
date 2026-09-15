@@ -4,7 +4,6 @@ const { fetchPayoutRatio } = require('./fmpService');
 const { sleep } = require('../utils/helpers');
 
 // ---------- Payout ratio cache (24h TTL) ----------
-// Protects the FMP free tier (250 req/day). Keyed by uppercase symbol.
 const payoutCache = new Map();
 const PAYOUT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -20,7 +19,7 @@ async function getCachedPayoutRatio(symbol) {
   const value = await fetchPayoutRatio(key);
   payoutCache.set(key, { value, timestamp: Date.now() });
 
-  // Periodic cleanup so the Map doesn't grow forever
+  // Periodic cleanup
   if (payoutCache.size > 500) {
     const cutoff = Date.now() - PAYOUT_CACHE_TTL_MS;
     for (const [k, v] of payoutCache.entries()) {
@@ -31,8 +30,7 @@ async function getCachedPayoutRatio(symbol) {
   return value;
 }
 
-// ---------- Concurrency limiter for batch FMP calls ----------
-// Prevents a 20-symbol watchlist from firing 20 FMP requests in parallel.
+// ---------- Concurrency limiter ----------
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
@@ -60,11 +58,10 @@ async function getStock(symbol, market, type = 'stock') {
   if (stock && Date.now() - new Date(stock.lastUpdated).getTime() < 12 * 60 * 60 * 1000) {
     const data = stock.dividendData || {};
 
-    // If the cached entry has no payoutRatio (or it's null), try FMP once
+    // Self-heal: if payoutRatio is missing from the cached blob, fetch + persist
     let payoutRatio = data.payoutRatio;
     if (payoutRatio == null) {
       payoutRatio = await getCachedPayoutRatio(cleanSymbol);
-      // Best-effort: persist to the cached JSONB so we don't re-fetch
       if (payoutRatio != null) {
         try {
           const merged = { ...data, payoutRatio };
@@ -92,7 +89,7 @@ async function getStock(symbol, market, type = 'stock') {
       currentYield: parseFloat(stock.currentYield),
       dividendCAGR: data.dividendCAGR || null,
       trailingAnnualDiv: data.trailingAnnualDiv || null,
-      payoutRatio: payoutRatio, // ✅ FMP-sourced (or null)
+      payoutRatio: payoutRatio,
       safetyScore: stock.safetyScore,
       exchange: data.exchange || (market === 'sg' ? 'SGX' : 'NASDAQ'),
     };
@@ -102,10 +99,9 @@ async function getStock(symbol, market, type = 'stock') {
   const data = await fetchDividendData(cleanSymbol, market);
   if (data.error || data.message) throw new Error(data.error || data.message);
 
-  // ✅ Override Yahoo-derived payoutRatio with the FMP value.
-  // This is stored inside dividendData (JSONB) so it persists.
-  const fmpPayoutRatio = await getCachedPayoutRatio(cleanSymbol);
-  data.payoutRatio = fmpPayoutRatio; // may be null — that's fine
+  // Override Yahoo-derived payoutRatio with our dedicated fetcher (Yahoo quoteSummary + FMP fallback)
+  const freshPayoutRatio = await getCachedPayoutRatio(cleanSymbol);
+  data.payoutRatio = freshPayoutRatio;
 
   await Stock.upsert({
     symbol: data.symbol || cleanSymbol,
@@ -126,7 +122,7 @@ async function getStock(symbol, market, type = 'stock') {
   return data;
 }
 
-// ---------- Batch (watchlist, comparison, portfolio) ----------
+// ---------- Batch ----------
 async function getBatchStocks(symbols, market) {
   if (!Array.isArray(symbols) || symbols.length === 0) return [];
 
@@ -140,7 +136,7 @@ async function getBatchStocks(symbols, market) {
   });
 }
 
-// ---------- Refresh top stocks & ETFs (admin job) ----------
+// ---------- Refresh top stocks & ETFs ----------
 async function refreshTopStocks(market = 'us') {
   const stockSymbols = market === 'us'
     ? ['VZ','T','KHC','MO','ABBV','PFE','XOM','CVX','JPM','BAC','WFC','KO','PEP','MCD','MSFT','AAPL','NVDA','JNJ','PG','HD']
@@ -150,7 +146,6 @@ async function refreshTopStocks(market = 'us') {
     ? ['SPY','QQQ','VTI','VOO','IVV','BND','AGG','GLD','SLV','EEM','EFA','IWM','XLK','XLF','XLE','XLI','XLV','XLY','XLP','XLU']
     : ['ES3.SI','G3B.SI','CFA.SI','O87.SI','M62.SI','N6M.SI','S27.SI','ER7.SI','NS8U.SI','GRN.SI'];
 
-  // Wipe existing entries for this market to avoid duplicates
   await Stock.destroy({ where: { market } });
 
   for (const symbol of stockSymbols) {

@@ -1,62 +1,90 @@
 /* backend/src/services/fmpService.js
- * Fetches the TTM dividend payout ratio from Financial Modeling Prep.
+ * Payout ratio fetcher.
  *
- * IMPORTANT: FMP retired their /api/v3/ endpoints on 2025-08-31.
- * New signups MUST use /stable/ endpoints. This file uses /stable/ratios-ttm.
+ * Strategy:
+ *   1. Yahoo Finance quoteSummary (financialData module) — primary source.
+ *      Free, no signup, works for US + SGX.
+ *   2. FMP /stable/ratios-ttm — secondary fallback for US stocks (only if
+ *      you upgrade to a paid plan that includes ratios).
+ *   3. Manual computation from dividendRate / trailingEps — last resort.
  *
- * FMP free tier only covers US-listed companies. SGX symbols are skipped.
+ * Returns a percentage (e.g. 45.2) or null.
  */
 
+const yahooFinance = require('yahoo-finance2');
 const axios = require('axios');
 
 const FMP_API_KEY = process.env.FMP_API_KEY;
 const FMP_BASE_URL = 'https://financialmodelingprep.com/stable';
 
-/**
- * Fetch the TTM payout ratio for a US-listed symbol.
- * @param {string} symbol - e.g. "AAPL"
- * @returns {Promise<number|null>} - Percentage (e.g. 45.2) or null
- */
-async function fetchPayoutRatio(symbol) {
-  if (!FMP_API_KEY) {
-    console.warn('⚠️ FMP_API_KEY not set — skipping payout ratio fetch');
+// ---------- Yahoo (primary) ----------
+async function fetchFromYahoo(symbol) {
+  try {
+    const result = await yahooFinance.quoteSummary(symbol, {
+      modules: ['financialData', 'summaryDetail'],
+      validateResult: false,
+    });
+
+    const fd = result?.financialData || {};
+    const sd = result?.summaryDetail || {};
+
+    // Preferred: Yahoo's pre-computed payoutRatio (decimal, e.g. 0.45)
+    if (typeof fd.payoutRatio === 'number' && isFinite(fd.payoutRatio) && fd.payoutRatio > 0) {
+      return Math.round(fd.payoutRatio * 10000) / 100;
+    }
+
+    // Fallback: compute from dividendRate / trailingEps
+    const dividendRate = fd.dividendRate ?? sd.dividendRate;
+    const eps = fd.trailingEps ?? sd.trailingEps;
+    if (dividendRate != null && eps != null && eps > 0) {
+      return Math.round((dividendRate / eps) * 10000) / 100;
+    }
+
+    return null;
+  } catch (err) {
+    console.warn(`Yahoo payoutRatio failed for ${symbol}:`, err.message);
     return null;
   }
+}
+
+// ---------- FMP (secondary, US only) ----------
+async function fetchFromFmp(symbol) {
+  if (!FMP_API_KEY) return null;
 
   const cleanSymbol = String(symbol || '').toUpperCase().trim();
-  if (!cleanSymbol) return null;
-
-  // ✅ FMP free tier does not cover SGX. Skip silently to save quota.
-  if (cleanSymbol.endsWith('.SI')) {
-    return null;
-  }
+  if (!cleanSymbol || cleanSymbol.endsWith('.SI')) return null;
 
   try {
     const url = `${FMP_BASE_URL}/ratios-ttm?symbol=${encodeURIComponent(cleanSymbol)}&apikey=${FMP_API_KEY}`;
     const response = await axios.get(url, { timeout: 10000 });
 
-    // /stable/ratios-ttm returns an object, not an array
-    const row = response.data;
-    if (!row || Array.isArray(row)) return null;
+    const row = Array.isArray(response.data) ? response.data[0] : response.data;
+    if (!row) return null;
 
-    // FMP returns dividendPayoutRatioTTM as a decimal (0.45 = 45%)
     const raw = row.dividendPayoutRatioTTM;
     if (raw == null || isNaN(raw)) return null;
 
-    // Convert to percentage, round to 2 decimals
     return Math.round(Number(raw) * 10000) / 100;
   } catch (err) {
-    const status = err.response?.status;
-    const msg = err.response?.data?.['Error Message'] || err.response?.data?.message || err.message;
-
-    // Suppress noisy 403s for the free tier — they're expected for some symbols
-    if (status === 403) {
-      console.warn(`FMP ${cleanSymbol}: not available on free tier (403)`);
-    } else {
-      console.warn(`FMP payout fetch failed for ${cleanSymbol} (${status || 'network'}):`, msg);
-    }
+    // Silent fail — this is just a fallback
     return null;
   }
+}
+
+// ---------- Public API ----------
+async function fetchPayoutRatio(symbol) {
+  const cleanSymbol = String(symbol || '').toUpperCase().trim();
+  if (!cleanSymbol) return null;
+
+  // Try Yahoo first
+  const yahooValue = await fetchFromYahoo(cleanSymbol);
+  if (yahooValue != null) return yahooValue;
+
+  // Then FMP
+  const fmpValue = await fetchFromFmp(cleanSymbol);
+  if (fmpValue != null) return fmpValue;
+
+  return null;
 }
 
 module.exports = { fetchPayoutRatio };
