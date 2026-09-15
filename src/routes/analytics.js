@@ -38,9 +38,6 @@ function startOfToday() {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
-// ✅ NEW: Count unique visitors since a date.
-// Uses COALESCE(userEmail, visitorId) — a registered user is identified by email,
-// an anonymous visitor is identified by their persistent visitorId.
 async function countDistinctVisitors(sinceDate) {
   const result = await Event.findOne({
     attributes: [[
@@ -131,8 +128,6 @@ router.get('/dashboard', adminOnly, async (req, res) => {
     });
 
     // ---------- 4. Daily active VISITORS (last 30 days) ----------
-    // ✅ FIXED: No longer filters out anonymous users.
-    // Uses COALESCE(userEmail, visitorId) so both are counted as distinct people.
     const dauTimeline = await Event.findAll({
       attributes: [
         [fn('DATE', col('createdAt')), 'date'],
@@ -144,12 +139,114 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       raw: true,
     });
 
+    // ---------- 4a. Weekly Active Visitors (last 12 weeks) ----------
+    const wauTimeline = await Event.findAll({
+      attributes: [
+        [literal(`TO_CHAR(DATE_TRUNC('week', "createdAt"), 'YYYY-MM-DD')`), 'week'],
+        [literal('COUNT(DISTINCT COALESCE("userEmail", "visitorId"))'), 'count'],
+      ],
+      where: { createdAt: { [Op.gte]: daysAgo(84) } },
+      group: [literal(`DATE_TRUNC('week', "createdAt")`)],
+      order: [[literal(`DATE_TRUNC('week', "createdAt")`), 'ASC']],
+      raw: true,
+    });
+
+    // ---------- 4b. Page views timeline (last 30 days) ----------
+    const pageViewsTimeline = await Event.findAll({
+      attributes: [
+        [fn('DATE', col('createdAt')), 'date'],
+        [fn('COUNT', '*'), 'count'],
+        [literal('COUNT(DISTINCT COALESCE("userEmail", "visitorId"))'), 'uniqueVisitors'],
+      ],
+      where: {
+        eventType: 'page_view',
+        createdAt: { [Op.gte]: daysAgo(30) },
+      },
+      group: [fn('DATE', col('createdAt'))],
+      order: [[fn('DATE', col('createdAt')), 'ASC']],
+      raw: true,
+    });
+
+    // ---------- 4c. Top landing pages ----------
+    const pageViewEvents = await Event.findAll({
+      where: {
+        eventType: 'page_view',
+        createdAt: { [Op.gte]: daysAgo(30) },
+      },
+      attributes: ['eventData'],
+      raw: true,
+    });
+    const pageCounts = {};
+    for (const e of pageViewEvents) {
+      const p = String(e.eventData?.path || '/').slice(0, 200);
+      if (!pageCounts[p]) pageCounts[p] = { path: p, count: 0 };
+      pageCounts[p].count += 1;
+    }
+    const topPages = Object.values(pageCounts)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    // ---------- 4d. Traffic sources ----------
+    const categorizeReferrer = (raw) => {
+      const r = String(raw || '').toLowerCase();
+      if (!r || r.includes('dividendbro.com')) return 'Direct / Internal';
+      if (r.includes('google.')) return 'Google';
+      if (r.includes('reddit.')) return 'Reddit';
+      if (r.includes('twitter.') || r.includes('x.com') || r.includes('t.co')) return 'X (Twitter)';
+      if (r.includes('facebook.') || r.includes('fb.com')) return 'Facebook';
+      if (r.includes('bing.')) return 'Bing';
+      if (r.includes('duckduckgo.')) return 'DuckDuckGo';
+      if (r.includes('linkedin.')) return 'LinkedIn';
+      if (r.includes('producthunt.')) return 'Product Hunt';
+      if (r.includes('news.ycombinator.')) return 'Hacker News';
+      return 'Other';
+    };
+    const sourceCounts = {};
+    for (const e of pageViewEvents) {
+      const src = categorizeReferrer(e.eventData?.referrer);
+      sourceCounts[src] = (sourceCounts[src] || 0) + 1;
+    }
+    const topSources = Object.entries(sourceCounts)
+      .map(([source, count]) => ({ source, count }))
+      .sort((a, b) => b.count - a.count);
+
+    // ---------- 4e. Visitor geography ----------
+    const geoRows = await Event.findAll({
+      attributes: [
+        'country',
+        [literal('COUNT(DISTINCT COALESCE("userEmail", "visitorId"))'), 'visitors'],
+        [fn('COUNT', '*'), 'events'],
+      ],
+      where: {
+        createdAt: { [Op.gte]: daysAgo(30) },
+        country: { [Op.ne]: null },
+      },
+      group: ['country'],
+      order: [[literal('COUNT(DISTINCT COALESCE("userEmail", "visitorId"))'), 'DESC']],
+      raw: true,
+    });
+    const visitorGeography = geoRows
+      .filter(r => r.country && r.country !== 'XX' && r.country !== 'T1')
+      .slice(0, 15)
+      .map(r => ({
+        country: r.country,
+        visitors: parseInt(r.visitors, 10),
+        events: parseInt(r.events, 10),
+      }));
+
+    // ---------- 4f. Device breakdown ----------
+    const deviceCounts = {};
+    for (const e of pageViewEvents) {
+      const d = String(e.eventData?.device || 'unknown');
+      deviceCounts[d] = (deviceCounts[d] || 0) + 1;
+    }
+    const devices = Object.entries(deviceCounts)
+      .map(([device, count]) => ({ device, count }))
+      .sort((a, b) => b.count - a.count);
+
     // ---------- 5. Feature usage (last 30 days) ----------
     const featureUsage = await Event.findAll({
-      attributes: [
-        'eventType',
-        [fn('COUNT', '*'), 'count'],
-      ],
+      attributes: ['eventType', [fn('COUNT', '*'), 'count']],
       where: { createdAt: { [Op.gte]: daysAgo(30) } },
       group: ['eventType'],
       order: [[fn('COUNT', '*'), 'DESC']],
@@ -255,18 +352,16 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       cohorts.push(cohortData);
     }
 
-    // ---------- Stickiness (visitor-based now) ----------
+    // ---------- Stickiness ----------
     const stickiness = visitors30d > 0 ? Math.round((visitorsToday / visitors30d) * 100) : 0;
     const dailyStickiness = visitors7d > 0 ? Math.round((visitorsToday / visitors7d) * 100) : 0;
 
     res.json({
       generatedAt: now.toISOString(),
       users: {
-        // Registered users
         total: totalUsers,
         signupsToday, signups7d, signups30d,
         activeToday, active7d, active30d,
-        // ✅ NEW: Visitors (anonymous + registered)
         visitorsToday, visitors7d, visitors30d,
         usersWithPortfolio, usersWithWatchlist,
         portfolioAdoptionPct: totalUsers > 0 ? Math.round((usersWithPortfolio / totalUsers) * 100) : 0,
@@ -282,7 +377,13 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       timelines: {
         signups: signupsTimeline,
         dau: dauTimeline,
+        wau: wauTimeline,
+        pageViews: pageViewsTimeline,
       },
+      topPages,
+      topSources,
+      visitorGeography,
+      devices,
       featureUsage,
       topSearches,
       topViewed,

@@ -1,5 +1,6 @@
 /* backend/src/routes/events.js
  * Receives batched analytics events from the frontend.
+ * Captures Cloudflare's CF-IPCountry header for visitor geo.
  */
 
 const express = require('express');
@@ -7,7 +8,9 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Event = require('../models/Event');
 
+// Whitelist of event types we accept
 const ALLOWED_EVENTS = new Set([
+  'page_view',
   'search',
   'view_stock',
   'add_portfolio',
@@ -46,6 +49,7 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'events array required' });
     }
 
+    // Optional auth to attach email
     let userEmail = null;
     const authHeader = req.headers.authorization;
     if (authHeader) {
@@ -56,6 +60,11 @@ router.post('/', async (req, res) => {
       } catch (e) {}
     }
 
+    // ✅ Cloudflare sends the visitor's country as a 2-letter code.
+    // No API calls, no cost. Falls back to null off-Cloudflare (e.g. localhost).
+    const country = String(req.headers['cf-ipcountry'] || '').toUpperCase().slice(0, 2) || null;
+
+    // Cap batch size
     const batch = events.slice(0, 50);
 
     const rows = batch
@@ -65,7 +74,8 @@ router.post('/', async (req, res) => {
         eventType: e.event_type,
         eventData: e.event_data || {},
         sessionId: e.session_id || null,
-        visitorId: e.visitor_id || null,   // ✅ NEW
+        visitorId: e.visitor_id || null,
+        country,
         createdAt: new Date(),
       }));
 

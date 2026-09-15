@@ -23,9 +23,14 @@ const Event = sequelize.define('Event', {
     type: DataTypes.STRING(50),
     allowNull: true,
   },
-  // ✅ NEW: Persistent anonymous visitor ID (localStorage-backed)
+  // ✅ Persistent anonymous visitor ID (localStorage-backed)
   visitorId: {
     type: DataTypes.STRING(50),
+    allowNull: true,
+  },
+  // ✅ ISO 3166-1 alpha-2 country code from Cloudflare (e.g. "SG", "US")
+  country: {
+    type: DataTypes.STRING(2),
     allowNull: true,
   },
   createdAt: {
@@ -39,7 +44,8 @@ const Event = sequelize.define('Event', {
     { fields: ['eventType'] },
     { fields: ['createdAt'] },
     { fields: ['userEmail'] },
-    { fields: ['visitorId'] },   // ✅ NEW
+    { fields: ['visitorId'] },
+    { fields: ['country'] },
   ],
 });
 
