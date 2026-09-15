@@ -1,5 +1,5 @@
 const { fetchJson, sleep, currencySymbol, round2, pct, isoOf } = require('../utils/helpers');
-const yahooFinance = require('yahoo-finance2'); 
+const yahooFinance = require('yahoo-finance2');
 
 const UA = process.env.YAHOO_FINANCE_UA || 'Mozilla/5.0 (compatible; DividendHub/2.0)';
 
@@ -80,24 +80,24 @@ async function fetchSplitsRaw(symbol) {
 async function yahooSearch(q, market) {
   const region = market === 'sg' ? 'SG' : 'US';
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=24&newsCount=0&lang=en-US&region=${region}`;
-  
+
   const data = await fetchJson(url);
   const quotes = data.quotes || [];
-  
+
   let filtered;
-  
+
   if (market === 'sg') {
-    filtered = quotes.filter(x => 
-      String(x.symbol || '').toUpperCase().endsWith('.SI') && 
+    filtered = quotes.filter(x =>
+      String(x.symbol || '').toUpperCase().endsWith('.SI') &&
       ['EQUITY', 'MUTUALFUND', 'ETF', 'TRUST'].includes(x.quoteType)
     );
   } else {
-    filtered = quotes.filter(x => 
-      ['EQUITY', 'ETF'].includes(x.quoteType) && 
+    filtered = quotes.filter(x =>
+      ['EQUITY', 'ETF'].includes(x.quoteType) &&
       (x.exchange === 'NYQ' || x.exchange === 'NMS' || x.exchange === 'BATS' || x.exchange === 'PCX' || !String(x.symbol).includes(':'))
     );
   }
-  
+
   return filtered.map(x => ({
     symbol: x.symbol,
     shortname: x.shortname || x.symbol,
@@ -106,13 +106,120 @@ async function yahooSearch(q, market) {
   }));
 }
 
+// ================================================================
+// ✅ NEW: Compute dividend metrics from a byYear array.
+//
+// Fixes three data quality bugs:
+//   1. dividendCAGR — only uses COMPLETE years (excludes current partial year)
+//   2. dividendFrequency — mode of last 3 complete years (not current partial)
+//   3. dividendStreak — consecutive years of increase, walking backwards,
+//      stopping at the first year that decreased or at a gap in the calendar.
+//
+// This is called both on fresh fetch AND on cache hit, so old cached
+// entries get corrected without needing a manual cache bust.
+// ================================================================
+function computeDividendMetrics(byYear) {
+  const empty = { dividendCAGR: null, dividendFrequency: null, dividendStreak: 0, completeYears: [] };
+  if (!Array.isArray(byYear) || byYear.length === 0) return empty;
+
+  const currentYear = new Date().getUTCFullYear();
+
+  // Build ascending map and list of complete years (exclude current year, which may be partial)
+  const asc = [...byYear].sort((a, b) => a.year - b.year);
+  const map = {};
+  for (const y of asc) map[y.year] = y;
+
+  const completeYears = asc
+    .map(y => y.year)
+    .filter(y => y < currentYear);
+
+  // ---------- 5-Year CAGR (complete years only) ----------
+  let dividendCAGR = null;
+  if (completeYears.length >= 2) {
+    const latestComplete = completeYears[completeYears.length - 1];
+    const targetYear = latestComplete - 5;
+
+    let startYear = completeYears[0];
+    for (const y of completeYears) {
+      if (y >= targetYear) { startYear = y; break; }
+    }
+
+    if (startYear < latestComplete) {
+      const startTotal = map[startYear]?.total;
+      const endTotal = map[latestComplete]?.total;
+      if (startTotal > 0 && endTotal > 0) {
+        const yearsDiff = latestComplete - startYear;
+        if (yearsDiff > 0) {
+          const raw = (Math.pow(endTotal / startTotal, 1 / yearsDiff) - 1) * 100;
+          dividendCAGR = Math.round(raw * 100) / 100;
+        }
+      }
+    }
+  }
+
+  // ---------- Frequency: mode of last 3 complete years ----------
+  let dividendFrequency = null;
+  if (completeYears.length > 0) {
+    const last3 = completeYears.slice(-3);
+    const counts = last3.map(y => map[y]?.count || 0).filter(c => c > 0);
+    if (counts.length > 0) {
+      const tally = {};
+      for (const c of counts) tally[c] = (tally[c] || 0) + 1;
+      let bestCount = 0, mode = null;
+      for (const [count, freq] of Object.entries(tally)) {
+        if (freq > bestCount) { bestCount = freq; mode = parseInt(count, 10); }
+      }
+      dividendFrequency = mode;
+    }
+  }
+
+  // ---------- Streak: consecutive years of increase ----------
+  // Walk backwards from the latest complete year. Stop at the first
+  // year where the total decreased, or at a gap in the calendar.
+  let dividendStreak = 0;
+  if (completeYears.length > 0) {
+    dividendStreak = 1;
+    for (let i = completeYears.length - 1; i > 0; i--) {
+      const curYear = completeYears[i];
+      const prevYear = completeYears[i - 1];
+      if (curYear !== prevYear + 1) break; // calendar gap
+
+      const cur = map[curYear]?.total || 0;
+      const prev = map[prevYear]?.total || 0;
+      if (cur >= prev && prev > 0) {
+        dividendStreak++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  return { dividendCAGR, dividendFrequency, dividendStreak, completeYears };
+}
+
 async function fetchDividendData(symbol, market) {
   try {
     const { currency, dividends } = await fetchDividendsRaw(symbol, market);
-    let payoutRatio = null;
 
     if (!dividends.length) {
-      return { symbol, currency: currency || (market === 'sg' ? 'SGD' : 'USD'), currencySymbol: currencySymbol(currency || 'USD', market), name: symbol, totalDividend: 0, payoutCount: 0, byYear: [], message: 'No dividend history found.', currentPrice: null, currentYield: null, dividendCAGR: null, payoutRatio: null, safetyScore: 'Caution', exchange: market === 'sg' ? 'SGX' : 'NASDAQ' };
+      return {
+        symbol,
+        currency: currency || (market === 'sg' ? 'SGD' : 'USD'),
+        currencySymbol: currencySymbol(currency || 'USD', market),
+        name: symbol,
+        totalDividend: 0,
+        payoutCount: 0,
+        byYear: [],
+        message: 'No dividend history found.',
+        currentPrice: null,
+        currentYield: null,
+        dividendCAGR: null,
+        dividendFrequency: null,
+        dividendStreak: 0,
+        payoutRatio: null,
+        safetyScore: 'Caution',
+        exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+      };
     }
 
     const byYearMap = {};
@@ -129,13 +236,17 @@ async function fetchDividendData(symbol, market) {
     }
     const byYear = Object.values(byYearMap).sort((a, b) => b.year - a.year);
     byYear.forEach(y => {
-      y.payouts.sort((a, b) => a.date < b.date ? -1 : 1);
+      y.payouts.sort((a, b) => (a.date < b.date ? -1 : 1));
       y.total = Math.round(y.total * 1e6) / 1e6;
     });
+
     const dates = dividends.map(d => isoOf(d.epoch)).sort();
     const name = await resolveName(symbol, market);
 
-    let currentPrice = null, currentYield = null, dividendCAGR = null, trailingAnnualDiv = 0;
+    // ✅ Compute corrected metrics (CAGR, frequency, streak) from byYear
+    const metrics = computeDividendMetrics(byYear);
+
+    let currentPrice = null, currentYield = null, trailingAnnualDiv = 0;
     try {
       const priceData = await fetchPricesRaw(symbol, Math.floor(Date.now() / 1000) - 90 * 86400);
       const meta = priceData.meta || {};
@@ -156,37 +267,16 @@ async function fetchDividendData(symbol, market) {
       }
     } catch (e) { /* skip */ }
 
+    // ---------- Safety score (unchanged logic) ----------
+    let safetyScore = 'Caution';
+    let payoutRatio = null;
     try {
       const years = Object.keys(byYearMap).map(Number).sort((a, b) => a - b);
-      if (years.length >= 2) {
-        const latestYear = years[years.length - 1];
-        const targetYear = latestYear - 5;
-        let startYear = years[0];
-        for (const y of years) {
-          if (y >= targetYear) { startYear = y; break; }
-        }
-        if (startYear < latestYear) {
-          const startTotal = byYearMap[startYear].total;
-          const endTotal = byYearMap[latestYear].total;
-          if (startTotal > 0 && endTotal > 0) {
-            const yearsDiff = latestYear - startYear;
-            if (yearsDiff > 0) {
-              dividendCAGR = (Math.pow(endTotal / startTotal, 1 / yearsDiff) - 1) * 100;
-              dividendCAGR = Math.round(dividendCAGR * 100) / 100;
-            }
-          }
-        }
-      }
-    } catch (e) { /* skip */ }
-
-    let safetyScore = 'Caution';
-    try {
-      const years = Object.keys(byYearMap).map(Number).sort((a,b)=>a-b);
       let maxStreak = 1;
       if (years.length > 0) {
         let currentStreak = 1;
         for (let i = 1; i < years.length; i++) {
-          if (years[i] === years[i-1] + 1) {
+          if (years[i] === years[i - 1] + 1) {
             currentStreak++;
             maxStreak = Math.max(maxStreak, currentStreak);
           } else {
@@ -195,10 +285,10 @@ async function fetchDividendData(symbol, market) {
         }
       }
       const divs = years.map(y => byYearMap[y].total);
-      const avgDiv = divs.length ? divs.reduce((a,b) => a+b, 0) / divs.length : 0;
+      const avgDiv = divs.length ? divs.reduce((a, b) => a + b, 0) / divs.length : 0;
       let cv = 99;
       if (avgDiv > 0) {
-        const variance = divs.reduce((a,b) => a + (b-avgDiv)**2, 0) / divs.length;
+        const variance = divs.reduce((a, b) => a + (b - avgDiv) ** 2, 0) / divs.length;
         const stdDev = Math.sqrt(variance);
         cv = stdDev / avgDiv;
       }
@@ -221,11 +311,56 @@ async function fetchDividendData(symbol, market) {
       else if (score >= 3) safetyScore = 'Moderate';
     } catch (e) { /* ignore */ }
 
-    return { symbol, name, currency: currency || 'USD', currencySymbol: currencySymbol(currency || 'USD', market), totalDividend: Math.round(total * 1e6) / 1e6, payoutCount: dividends.length, firstExDate: dates[0] || null, lastExDate: dates[dates.length - 1] || null, byYear, currentPrice: currentPrice ? round2(currentPrice) : null, currentYield, dividendCAGR, trailingAnnualDiv, payoutRatio: payoutRatio ? Math.round(payoutRatio * 100) / 100 : null, safetyScore, exchange: market === 'sg' ? 'SGX' : 'NASDAQ' };
+    return {
+      symbol,
+      name,
+      currency: currency || 'USD',
+      currencySymbol: currencySymbol(currency || 'USD', market),
+      totalDividend: Math.round(total * 1e6) / 1e6,
+      payoutCount: dividends.length,
+      firstExDate: dates[0] || null,
+      lastExDate: dates[dates.length - 1] || null,
+      byYear,
+      currentPrice: currentPrice ? round2(currentPrice) : null,
+      currentYield,
+      dividendCAGR: metrics.dividendCAGR,
+      dividendFrequency: metrics.dividendFrequency,
+      dividendStreak: metrics.dividendStreak,
+      trailingAnnualDiv,
+      payoutRatio: payoutRatio ? Math.round(payoutRatio * 100) / 100 : null,
+      safetyScore,
+      exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+    };
   } catch (e) {
     console.error('fetchDividendData error:', e);
-    return { symbol, currency: market === 'sg' ? 'SGD' : 'USD', currencySymbol: market === 'sg' ? 'S$' : '$', name: symbol, totalDividend: 0, payoutCount: 0, byYear: [], message: e.message || 'Failed to fetch dividend data', currentPrice: null, currentYield: null, dividendCAGR: null, payoutRatio: null, safetyScore: 'Caution', exchange: market === 'sg' ? 'SGX' : 'NASDAQ' };
+    return {
+      symbol,
+      currency: market === 'sg' ? 'SGD' : 'USD',
+      currencySymbol: market === 'sg' ? 'S$' : '$',
+      name: symbol,
+      totalDividend: 0,
+      payoutCount: 0,
+      byYear: [],
+      message: e.message || 'Failed to fetch dividend data',
+      currentPrice: null,
+      currentYield: null,
+      dividendCAGR: null,
+      dividendFrequency: null,
+      dividendStreak: 0,
+      payoutRatio: null,
+      safetyScore: 'Caution',
+      exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+    };
   }
 }
 
-module.exports = { fetchDividendData, fetchDividendsRaw, fetchPricesRaw, fetchEPSRaw, fetchSplitsRaw, resolveName, yahooSearch };
+module.exports = {
+  fetchDividendData,
+  fetchDividendsRaw,
+  fetchPricesRaw,
+  fetchEPSRaw,
+  fetchSplitsRaw,
+  resolveName,
+  yahooSearch,
+  computeDividendMetrics, // ✅ NEW
+};

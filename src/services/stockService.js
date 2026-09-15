@@ -1,5 +1,5 @@
 const Stock = require('../models/stock');
-const { fetchDividendData } = require('./yahooFinance');
+const { fetchDividendData, computeDividendMetrics } = require('./yahooFinance');
 const { fetchPayoutRatio } = require('./fmpService');
 const { sleep } = require('../utils/helpers');
 
@@ -19,7 +19,6 @@ async function getCachedPayoutRatio(symbol) {
   const value = await fetchPayoutRatio(key);
   payoutCache.set(key, { value, timestamp: Date.now() });
 
-  // Periodic cleanup
   if (payoutCache.size > 500) {
     const cutoff = Date.now() - PAYOUT_CACHE_TTL_MS;
     for (const [k, v] of payoutCache.entries()) {
@@ -54,11 +53,16 @@ async function getStock(symbol, market, type = 'stock') {
 
   const stock = await Stock.findByPk(cleanSymbol);
 
-  // Cached path (12-hour window)
+  // ---------- Cached path (12-hour window) ----------
   if (stock && Date.now() - new Date(stock.lastUpdated).getTime() < 12 * 60 * 60 * 1000) {
     const data = stock.dividendData || {};
 
-    // Self-heal: if payoutRatio is missing from the cached blob, fetch + persist
+    // ✅ Recompute metrics from byYear on every cache hit.
+    // This self-heals stale values left behind by the old (buggy) formula,
+    // without needing to bust the entire cache.
+    const metrics = computeDividendMetrics(data.byYear || []);
+
+    // Self-heal payout ratio if missing
     let payoutRatio = data.payoutRatio;
     if (payoutRatio == null) {
       payoutRatio = await getCachedPayoutRatio(cleanSymbol);
@@ -67,9 +71,7 @@ async function getStock(symbol, market, type = 'stock') {
           const merged = { ...data, payoutRatio };
           stock.dividendData = merged;
           await stock.save();
-        } catch (e) {
-          // ignore persistence errors
-        }
+        } catch (e) { /* ignore */ }
       }
     }
 
@@ -87,7 +89,9 @@ async function getStock(symbol, market, type = 'stock') {
       byYear: data.byYear || [],
       currentPrice: parseFloat(stock.currentPrice),
       currentYield: parseFloat(stock.currentYield),
-      dividendCAGR: data.dividendCAGR || null,
+      dividendCAGR: metrics.dividendCAGR,           // ✅ Recomputed from complete years
+      dividendFrequency: metrics.dividendFrequency, // ✅ NEW
+      dividendStreak: metrics.dividendStreak,       // ✅ NEW
       trailingAnnualDiv: data.trailingAnnualDiv || null,
       payoutRatio: payoutRatio,
       safetyScore: stock.safetyScore,
@@ -95,11 +99,10 @@ async function getStock(symbol, market, type = 'stock') {
     };
   }
 
-  // Fresh fetch path
+  // ---------- Fresh fetch path ----------
   const data = await fetchDividendData(cleanSymbol, market);
   if (data.error || data.message) throw new Error(data.error || data.message);
 
-  // Override Yahoo-derived payoutRatio with our dedicated fetcher (Yahoo quoteSummary + FMP fallback)
   const freshPayoutRatio = await getCachedPayoutRatio(cleanSymbol);
   data.payoutRatio = freshPayoutRatio;
 
