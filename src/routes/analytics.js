@@ -5,7 +5,7 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
-const { Op, fn, col, literal, QueryTypes } = require('sequelize');
+const { Op, fn, col, literal } = require('sequelize');
 const sequelize = require('../config/database');
 const User = require('../models/User');
 const Event = require('../models/Event');
@@ -29,7 +29,7 @@ function adminOnly(req, res, next) {
   }
 }
 
-// ---------- Helper ----------
+// ---------- Helpers ----------
 function daysAgo(n) {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000);
 }
@@ -38,14 +38,28 @@ function startOfToday() {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
+// ✅ NEW: Count unique visitors since a date.
+// Uses COALESCE(userEmail, visitorId) — a registered user is identified by email,
+// an anonymous visitor is identified by their persistent visitorId.
+async function countDistinctVisitors(sinceDate) {
+  const result = await Event.findOne({
+    attributes: [[
+      literal('COUNT(DISTINCT COALESCE("userEmail", "visitorId"))'),
+      'count',
+    ]],
+    where: { createdAt: { [Op.gte]: sinceDate } },
+    raw: true,
+  });
+  return parseInt(result?.count || 0, 10);
+}
+
 // ---------- GET /api/analytics/dashboard ----------
-// One call that returns everything the admin dashboard needs
 router.get('/dashboard', adminOnly, async (req, res) => {
   try {
     const now = new Date();
     const today = startOfToday();
 
-    // ---------- 1. User counts ----------
+    // ---------- 1. User counts (registered) ----------
     const [
       totalUsers, signupsToday, signups7d, signups30d,
       activeToday, active7d, active30d,
@@ -57,6 +71,13 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       User.count({ where: { lastLoginAt: { [Op.gte]: today } } }),
       User.count({ where: { lastLoginAt: { [Op.gte]: daysAgo(7) } } }),
       User.count({ where: { lastLoginAt: { [Op.gte]: daysAgo(30) } } }),
+    ]);
+
+    // ---------- 1b. Visitor counts (anonymous + registered) ----------
+    const [visitorsToday, visitors7d, visitors30d] = await Promise.all([
+      countDistinctVisitors(today),
+      countDistinctVisitors(daysAgo(7)),
+      countDistinctVisitors(daysAgo(30)),
     ]);
 
     // ---------- 2. Portfolio & watchlist adoption ----------
@@ -109,16 +130,15 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       raw: true,
     });
 
-    // ---------- 4. Daily active users (last 30 days from events) ----------
+    // ---------- 4. Daily active VISITORS (last 30 days) ----------
+    // ✅ FIXED: No longer filters out anonymous users.
+    // Uses COALESCE(userEmail, visitorId) so both are counted as distinct people.
     const dauTimeline = await Event.findAll({
       attributes: [
         [fn('DATE', col('createdAt')), 'date'],
-        [fn('COUNT', fn('DISTINCT', col('userEmail'))), 'count'],
+        [literal('COUNT(DISTINCT COALESCE("userEmail", "visitorId"))'), 'count'],
       ],
-      where: {
-        createdAt: { [Op.gte]: daysAgo(30) },
-        userEmail: { [Op.ne]: null },
-      },
+      where: { createdAt: { [Op.gte]: daysAgo(30) } },
       group: [fn('DATE', col('createdAt'))],
       order: [[fn('DATE', col('createdAt')), 'ASC']],
       raw: true,
@@ -136,12 +156,9 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       raw: true,
     });
 
-    // ---------- 6. Top searched tickers (last 30 days) ----------
+    // ---------- 6. Top searched tickers ----------
     const searchEvents = await Event.findAll({
-      where: {
-        eventType: 'search',
-        createdAt: { [Op.gte]: daysAgo(30) },
-      },
+      where: { eventType: 'search', createdAt: { [Op.gte]: daysAgo(30) } },
       attributes: ['eventData'],
       raw: true,
     });
@@ -152,12 +169,9 @@ router.get('/dashboard', adminOnly, async (req, res) => {
     }
     const topSearches = Object.entries(searchCounts).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([query,count])=>({query,count}));
 
-    // ---------- 7. Top viewed stocks (last 30 days) ----------
+    // ---------- 7. Top viewed stocks ----------
     const viewEvents = await Event.findAll({
-      where: {
-        eventType: 'view_stock',
-        createdAt: { [Op.gte]: daysAgo(30) },
-      },
+      where: { eventType: 'view_stock', createdAt: { [Op.gte]: daysAgo(30) } },
       attributes: ['eventData'],
       raw: true,
     });
@@ -170,10 +184,7 @@ router.get('/dashboard', adminOnly, async (req, res) => {
 
     // ---------- 8. Chat usage breakdown ----------
     const chatEvents = await Event.findAll({
-      where: {
-        eventType: 'chat_message',
-        createdAt: { [Op.gte]: daysAgo(30) },
-      },
+      where: { eventType: 'chat_message', createdAt: { [Op.gte]: daysAgo(30) } },
       attributes: ['eventData'],
       raw: true,
     });
@@ -186,10 +197,7 @@ router.get('/dashboard', adminOnly, async (req, res) => {
 
     // ---------- 9. Top viewed articles ----------
     const articleEvents = await Event.findAll({
-      where: {
-        eventType: 'view_article',
-        createdAt: { [Op.gte]: daysAgo(30) },
-      },
+      where: { eventType: 'view_article', createdAt: { [Op.gte]: daysAgo(30) } },
       attributes: ['eventData'],
       raw: true,
     });
@@ -200,7 +208,7 @@ router.get('/dashboard', adminOnly, async (req, res) => {
     }
     const topArticles = Object.entries(articleCounts).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([slug,count])=>({slug,count}));
 
-    // ---------- 10. Cohort retention (last 8 weeks) ----------
+    // ---------- 10. Cohort retention ----------
     const cohorts = [];
     const nowUTC = new Date();
     for (let w = 7; w >= 0; w--) {
@@ -220,37 +228,25 @@ router.get('/dashboard', adminOnly, async (req, res) => {
 
       const cohortData = { week: weekStart.toISOString().slice(0, 10), size: cohortEmails.length, w1: 0, w2: 0, w4: 0 };
 
-      // Week 1 activity
       const w1End = new Date(weekStart); w1End.setDate(w1End.getDate() + 14);
       const w1Active = await Event.count({
-        where: {
-          userEmail: { [Op.in]: cohortEmails },
-          createdAt: { [Op.gte]: weekStart, [Op.lt]: w1End },
-        },
+        where: { userEmail: { [Op.in]: cohortEmails }, createdAt: { [Op.gte]: weekStart, [Op.lt]: w1End } },
         distinct: true,
         col: 'userEmail',
       });
       cohortData.w1 = Math.round((w1Active / cohortEmails.length) * 100);
 
-      // Week 2 activity
       const w2End = new Date(weekStart); w2End.setDate(w2End.getDate() + 21);
       const w2Active = await Event.count({
-        where: {
-          userEmail: { [Op.in]: cohortEmails },
-          createdAt: { [Op.gte]: w1End, [Op.lt]: w2End },
-        },
+        where: { userEmail: { [Op.in]: cohortEmails }, createdAt: { [Op.gte]: w1End, [Op.lt]: w2End } },
         distinct: true,
         col: 'userEmail',
       });
       cohortData.w2 = Math.round((w2Active / cohortEmails.length) * 100);
 
-      // Week 4 activity
       const w4End = new Date(weekStart); w4End.setDate(w4End.getDate() + 35);
       const w4Active = await Event.count({
-        where: {
-          userEmail: { [Op.in]: cohortEmails },
-          createdAt: { [Op.gte]: new Date(weekStart.getTime() + 21 * 86400000), [Op.lt]: w4End },
-        },
+        where: { userEmail: { [Op.in]: cohortEmails }, createdAt: { [Op.gte]: new Date(weekStart.getTime() + 21 * 86400000), [Op.lt]: w4End } },
         distinct: true,
         col: 'userEmail',
       });
@@ -259,16 +255,19 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       cohorts.push(cohortData);
     }
 
-    // ---------- Compute stickiness ----------
-    const stickiness = active30d > 0 ? Math.round((activeToday / active30d) * 100) : 0;
-    const dailyStickiness = active7d > 0 ? Math.round((activeToday / active7d) * 100) : 0;
+    // ---------- Stickiness (visitor-based now) ----------
+    const stickiness = visitors30d > 0 ? Math.round((visitorsToday / visitors30d) * 100) : 0;
+    const dailyStickiness = visitors7d > 0 ? Math.round((visitorsToday / visitors7d) * 100) : 0;
 
     res.json({
       generatedAt: now.toISOString(),
       users: {
+        // Registered users
         total: totalUsers,
         signupsToday, signups7d, signups30d,
         activeToday, active7d, active30d,
+        // ✅ NEW: Visitors (anonymous + registered)
+        visitorsToday, visitors7d, visitors30d,
         usersWithPortfolio, usersWithWatchlist,
         portfolioAdoptionPct: totalUsers > 0 ? Math.round((usersWithPortfolio / totalUsers) * 100) : 0,
         watchlistAdoptionPct: totalUsers > 0 ? Math.round((usersWithWatchlist / totalUsers) * 100) : 0,
@@ -315,16 +314,12 @@ router.get('/users', adminOnly, async (req, res) => {
       offset,
     });
 
-    // Get event counts for these users in last 7 days
     const emails = rows.map(r => r.email);
     const eventCounts = {};
     if (emails.length > 0) {
       const counts = await Event.findAll({
         attributes: ['userEmail', [fn('COUNT', '*'), 'count']],
-        where: {
-          userEmail: { [Op.in]: emails },
-          createdAt: { [Op.gte]: daysAgo(7) },
-        },
+        where: { userEmail: { [Op.in]: emails }, createdAt: { [Op.gte]: daysAgo(7) } },
         group: ['userEmail'],
         raw: true,
       });

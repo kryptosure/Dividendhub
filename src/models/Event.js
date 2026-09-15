@@ -23,6 +23,11 @@ const Event = sequelize.define('Event', {
     type: DataTypes.STRING(50),
     allowNull: true,
   },
+  // ✅ NEW: Persistent anonymous visitor ID (localStorage-backed)
+  visitorId: {
+    type: DataTypes.STRING(50),
+    allowNull: true,
+  },
   createdAt: {
     type: DataTypes.DATE,
     defaultValue: DataTypes.NOW,
@@ -34,6 +39,7 @@ const Event = sequelize.define('Event', {
     { fields: ['eventType'] },
     { fields: ['createdAt'] },
     { fields: ['userEmail'] },
+    { fields: ['visitorId'] },   // ✅ NEW
   ],
 });
 

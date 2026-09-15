@@ -7,9 +7,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Event = require('../models/Event');
 
-// Whitelist of event types we accept
 const ALLOWED_EVENTS = new Set([
-  // Existing events
   'search',
   'view_stock',
   'add_portfolio',
@@ -31,7 +29,6 @@ const ALLOWED_EVENTS = new Set([
   'open_watchlist',
   'toggle_theme',
   'toggle_market',
-  // ✅ NEW: Millionaire Simulator events
   'open_millionaire_simulator',
   'millionaire_autocomplete_select',
   'millionaire_select_from_leaderboard',
@@ -49,7 +46,6 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'events array required' });
     }
 
-    // Optional auth to attach email
     let userEmail = null;
     const authHeader = req.headers.authorization;
     if (authHeader) {
@@ -60,7 +56,6 @@ router.post('/', async (req, res) => {
       } catch (e) {}
     }
 
-    // Cap batch size
     const batch = events.slice(0, 50);
 
     const rows = batch
@@ -70,6 +65,7 @@ router.post('/', async (req, res) => {
         eventType: e.event_type,
         eventData: e.event_data || {},
         sessionId: e.session_id || null,
+        visitorId: e.visitor_id || null,   // ✅ NEW
         createdAt: new Date(),
       }));
 
