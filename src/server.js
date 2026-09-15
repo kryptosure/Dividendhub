@@ -14,6 +14,9 @@ const { yahooSearch } = require('./services/yahooFinance');
 const app = express();
 const PORT = process.env.PORT || 8000;
 
+// ✅ Trust Render's reverse proxy so express-rate-limit sees real client IPs
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors());
 app.use(compression());
@@ -31,13 +34,11 @@ app.use('/api/simulate', require('./routes/simulate'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/historical-price', require('./routes/historicalPrice'));
 
-// ✅ NEW: AI Chat proxy
 app.use('/api/chat', require('./routes/chat'));
 app.use('/api/analytics', require('./routes/analytics'));
-app.use('/api/events', require('./routes/events'));   // ← NEW
+app.use('/api/events', require('./routes/events'));
 
-// ---------- NEW: /api/search endpoint ----------
-// Fallback map for common names (as a last resort)
+// ---------- /api/search endpoint ----------
 const FALLBACK_MAP = {
   us: {
     'apple': [{ symbol: 'AAPL', name: 'Apple Inc.' }],
