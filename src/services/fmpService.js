@@ -1,12 +1,13 @@
 /* backend/src/services/fmpService.js
  * Payout ratio fetcher.
  *
- * Strategy:
- *   1. Yahoo Finance quoteSummary (financialData module) — primary source.
- *      Free, no signup, works for US + SGX.
- *   2. FMP /stable/ratios-ttm — secondary fallback for US stocks (only if
- *      you upgrade to a paid plan that includes ratios).
- *   3. Manual computation from dividendRate / trailingEps — last resort.
+ * Strategy (in order):
+ *   1. Yahoo quoteSummary → financialData.payoutRatio (pre-computed decimal)
+ *   2. Yahoo quoteSummary → dividendRate / trailingEps (compute ourselves)
+ *   3. Yahoo quoteSummary → dividendRate / defaultKeyStatistics.trailingEps
+ *      (alternate EPS location — sometimes financialData doesn't have it)
+ *   4. FMP /stable/ratios-ttm (US-listed only, requires paid tier for ratios)
+ *   5. null
  *
  * Returns a percentage (e.g. 45.2) or null.
  */
@@ -21,23 +22,37 @@ const FMP_BASE_URL = 'https://financialmodelingprep.com/stable';
 async function fetchFromYahoo(symbol) {
   try {
     const result = await yahooFinance.quoteSummary(symbol, {
-      modules: ['financialData', 'summaryDetail'],
+      modules: ['financialData', 'summaryDetail', 'defaultKeyStatistics'],
       validateResult: false,
     });
 
     const fd = result?.financialData || {};
     const sd = result?.summaryDetail || {};
+    const ks = result?.defaultKeyStatistics || {};
 
-    // Preferred: Yahoo's pre-computed payoutRatio (decimal, e.g. 0.45)
+    // ---------- 1. Pre-computed payoutRatio (decimal, e.g. 0.45) ----------
     if (typeof fd.payoutRatio === 'number' && isFinite(fd.payoutRatio) && fd.payoutRatio > 0) {
       return Math.round(fd.payoutRatio * 10000) / 100;
     }
 
-    // Fallback: compute from dividendRate / trailingEps
-    const dividendRate = fd.dividendRate ?? sd.dividendRate;
-    const eps = fd.trailingEps ?? sd.trailingEps;
-    if (dividendRate != null && eps != null && eps > 0) {
-      return Math.round((dividendRate / eps) * 10000) / 100;
+    // ---------- 2. Compute from dividendRate / EPS ----------
+    const dividendRate =
+      fd.dividendRate ??
+      sd.dividendRate ??
+      null;
+
+    // Try financialData.trailingEps first, then defaultKeyStatistics.trailingEps
+    const epsCandidates = [
+      fd.trailingEps,
+      ks.trailingEps,
+      fd.forwardEps,   // last resort — forward EPS
+    ];
+
+    for (const eps of epsCandidates) {
+      if (eps != null && isFinite(eps) && Number(eps) > 0 && dividendRate != null) {
+        const ratio = (Number(dividendRate) / Number(eps)) * 100;
+        return Math.round(ratio * 100) / 100;
+      }
     }
 
     return null;
@@ -76,11 +91,9 @@ async function fetchPayoutRatio(symbol) {
   const cleanSymbol = String(symbol || '').toUpperCase().trim();
   if (!cleanSymbol) return null;
 
-  // Try Yahoo first
   const yahooValue = await fetchFromYahoo(cleanSymbol);
   if (yahooValue != null) return yahooValue;
 
-  // Then FMP
   const fmpValue = await fetchFromFmp(cleanSymbol);
   if (fmpValue != null) return fmpValue;
 

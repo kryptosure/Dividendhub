@@ -120,10 +120,111 @@ router.get('/search', limiter, async (req, res) => {
   }
 });
 
-// ✅ UPDATED: Historical Long-Term Growth with Since Listing support
-// - Periods: 1, 5, 10, 15, 20, 25, 30 years
-// - Uses "Since Listing" for the first slot where data doesn't reach far enough
-// - Returns dynamic labels + null for slots beyond the listing date
+// ================================================================
+// Long-term growth: cache + retry + single-fetch optimization
+// ================================================================
+
+const growthCache = new Map();
+const GROWTH_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// Extract to a helper so we can retry on incomplete data
+async function computeLongTermGrowth(symbol, market, amount) {
+  // ✅ Single fetch covering both current price + 32Y history.
+  // Previously this endpoint made TWO fetchPricesRaw calls; combining
+  // them halves Yahoo load and reduces the chance of throttling.
+  const thirtyTwoYearsAgo = Math.floor(Date.now() / 1000) - (32 * 365 * 86400);
+  const { meta, timestamps, closes } = await fetchPricesRaw(symbol, thirtyTwoYearsAgo);
+  const { dividends } = await fetchDividendsRaw(symbol, market);
+
+  // Extract current price from meta (fallback: last non-null close)
+  let currentPrice = meta.regularMarketPrice;
+  if (!isFinite(currentPrice) || currentPrice == null) {
+    for (let i = closes.length - 1; i >= 0; i--) {
+      if (closes[i] != null) { currentPrice = closes[i]; break; }
+    }
+  }
+  if (!currentPrice) throw new Error('Could not determine current price');
+
+  const earliestEpoch = timestamps.length > 0 ? timestamps[0] : null;
+
+  const periods = [1, 5, 10, 15, 20, 25, 30];
+  const labels = [];
+  const noDrip = [];
+  const drip = [];
+  let sinceListingUsed = false;
+
+  for (const yearsAgo of periods) {
+    const startDate = new Date();
+    startDate.setFullYear(startDate.getFullYear() - yearsAgo);
+    const startEpoch = Math.floor(startDate.getTime() / 1000);
+
+    let effectiveEpoch = startEpoch;
+    let isSinceListing = false;
+
+    if (!earliestEpoch || earliestEpoch > startEpoch) {
+      if (!sinceListingUsed && earliestEpoch) {
+        effectiveEpoch = earliestEpoch;
+        isSinceListing = true;
+        sinceListingUsed = true;
+      } else {
+        labels.push(null);
+        noDrip.push(null);
+        drip.push(null);
+        continue;
+      }
+    }
+
+    let buyPrice = null;
+    for (let i = 0; i < timestamps.length; i++) {
+      if (timestamps[i] <= effectiveEpoch) buyPrice = closes[i];
+      else break;
+    }
+
+    if (!buyPrice) {
+      labels.push(null);
+      noDrip.push(null);
+      drip.push(null);
+      continue;
+    }
+
+    const sharesPurchased = amount / buyPrice;
+    const noDripValue = sharesPurchased * currentPrice;
+
+    let simulatedShares = sharesPurchased;
+    const divs = dividends.filter(d => d.epoch > effectiveEpoch);
+    for (const d of divs) {
+      const cashFromDiv = simulatedShares * d.amount;
+      let reinvestPrice = null;
+      for (let i = 0; i < timestamps.length; i++) {
+        if (timestamps[i] > d.epoch) {
+          reinvestPrice = closes[i];
+          break;
+        }
+      }
+      if (reinvestPrice && reinvestPrice > 0) {
+        simulatedShares += cashFromDiv / reinvestPrice;
+      }
+    }
+
+    const dripValue = simulatedShares * currentPrice;
+
+    labels.push(isSinceListing ? 'Since Listing' : `${yearsAgo}Y Ago`);
+    noDrip.push(Math.round(noDripValue * 100) / 100);
+    drip.push(Math.round(dripValue * 100) / 100);
+  }
+
+  return {
+    currencySymbol: market === 'sg' ? 'S$' : '$',
+    labels,
+    noDrip,
+    drip,
+    // Internal signal: if the 5Y slot is null but the 1Y slot is present,
+    // we probably got partial data from Yahoo and should retry.
+    _needsRetry: noDrip[0] != null && noDrip[1] == null,
+  };
+}
+
+// ✅ UPDATED: Historical Long-Term Growth with cache + retry
 router.get('/long-term-growth', limiter, async (req, res) => {
   let symbol = String(req.query.symbol || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -132,102 +233,46 @@ router.get('/long-term-growth', limiter, async (req, res) => {
   if (!symbol) return res.status(400).json({ error: 'symbol required' });
   if (market === 'sg' && !symbol.endsWith('.SI')) symbol += '.SI';
 
-  try {
-    // 1. Fetch current price
-    const { meta } = await fetchPricesRaw(symbol, Math.floor(Date.now() / 1000) - 90 * 86400);
-    const currentPrice = meta.regularMarketPrice;
-    if (!currentPrice) throw new Error('Could not determine current price');
+  // ---------- Cache hit ----------
+  const cacheKey = `${symbol}:${market}:${amount}`;
+  const cached = growthCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < GROWTH_CACHE_TTL_MS) {
+    return res.json(cached.data);
+  }
 
-    // 2. Fetch from 35 years ago (safety buffer for leap years + edge cases)
-    const thirtyFiveYearsAgo = Math.floor(Date.now() / 1000) - (35 * 365 * 86400);
-    const { timestamps, closes } = await fetchPricesRaw(symbol, thirtyFiveYearsAgo);
-    const { dividends } = await fetchDividendsRaw(symbol, market);
+  // ---------- Try up to 2 times ----------
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await computeLongTermGrowth(symbol, market, amount);
 
-    // 3. Earliest available data point
-    const earliestEpoch = timestamps.length > 0 ? timestamps[0] : null;
+      if (!result._needsRetry) {
+        // Strip the internal signal before returning
+        const { _needsRetry, ...publicResult } = result;
+        growthCache.set(cacheKey, { data: publicResult, timestamp: Date.now() });
 
-    // 4. Periods to compute
-    const periods = [1, 5, 10, 15, 20, 25, 30];
-    const labels = [];
-    const noDrip = [];
-    const drip = [];
-    let sinceListingUsed = false;
-
-    for (const yearsAgo of periods) {
-      const startDate = new Date();
-      startDate.setFullYear(startDate.getFullYear() - yearsAgo);
-      const startEpoch = Math.floor(startDate.getTime() / 1000);
-
-      let effectiveEpoch = startEpoch;
-      let isSinceListing = false;
-
-      // If the stock didn't exist that far back:
-      //   - Use "Since Listing" once (earliest available data)
-      //   - Mark subsequent slots as null
-      if (!earliestEpoch || earliestEpoch > startEpoch) {
-        if (!sinceListingUsed && earliestEpoch) {
-          effectiveEpoch = earliestEpoch;
-          isSinceListing = true;
-          sinceListingUsed = true;
-        } else {
-          labels.push(null);
-          noDrip.push(null);
-          drip.push(null);
-          continue;
-        }
-      }
-
-      // Find price at or before effectiveEpoch
-      let buyPrice = null;
-      for (let i = 0; i < timestamps.length; i++) {
-        if (timestamps[i] <= effectiveEpoch) buyPrice = closes[i];
-        else break;
-      }
-
-      if (!buyPrice) {
-        labels.push(null);
-        noDrip.push(null);
-        drip.push(null);
-        continue;
-      }
-
-      const sharesPurchased = amount / buyPrice;
-      const noDripValue = sharesPurchased * currentPrice;
-
-      // Simulate DRIP
-      let simulatedShares = sharesPurchased;
-      const divs = dividends.filter(d => d.epoch > effectiveEpoch);
-      for (const d of divs) {
-        const cashFromDiv = simulatedShares * d.amount;
-        let reinvestPrice = null;
-        for (let i = 0; i < timestamps.length; i++) {
-          if (timestamps[i] > d.epoch) {
-            reinvestPrice = closes[i];
-            break;
+        // Periodic cache cleanup
+        if (growthCache.size > 200) {
+          const cutoff = Date.now() - GROWTH_CACHE_TTL_MS;
+          for (const [k, v] of growthCache.entries()) {
+            if (v.timestamp < cutoff) growthCache.delete(k);
           }
         }
-        if (reinvestPrice && reinvestPrice > 0) {
-          simulatedShares += cashFromDiv / reinvestPrice;
-        }
+
+        return res.json(publicResult);
       }
 
-      const dripValue = simulatedShares * currentPrice;
-
-      labels.push(isSinceListing ? 'Since Listing' : `${yearsAgo}Y Ago`);
-      noDrip.push(Math.round(noDripValue * 100) / 100);
-      drip.push(Math.round(dripValue * 100) / 100);
+      lastError = new Error('Incomplete data on attempt ' + (attempt + 1));
+      if (attempt === 0) await new Promise(r => setTimeout(r, 700));
+    } catch (e) {
+      lastError = e;
+      if (attempt === 0) await new Promise(r => setTimeout(r, 700));
     }
-
-    res.json({
-      currencySymbol: market === 'sg' ? 'S$' : '$',
-      labels,
-      noDrip,
-      drip
-    });
-  } catch (e) {
-    console.error('Error fetching long-term growth:', e);
-    res.status(500).json({ error: 'Failed to fetch long-term growth data' });
   }
+
+  // Both attempts failed
+  console.error(`long-term-growth failed for ${symbol}:`, lastError?.message);
+  return res.status(500).json({ error: 'Failed to fetch long-term growth data' });
 });
 
 // ---------- Get single stock ----------
