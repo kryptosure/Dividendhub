@@ -16,7 +16,6 @@ router.post('/refresh', async (req, res) => {
     ];
 
     let updatedCount = 0;
-
     for (const symbol of usSymbols) {
       try {
         const quote = await yahooFinance.quote(symbol);
@@ -59,17 +58,24 @@ router.post('/seed-universe', async (req, res) => {
     return res.status(409).json({ error: 'Seed already in progress', lastSeedResult });
   }
 
-  const market = req.query.market || 'all'; // 'all', 'us', or 'sg'
+  const market = req.query.market || 'all';
   seedInProgress = true;
   lastSeedResult = null;
 
-  // Fire and forget — return immediately
   (async () => {
     const startedAt = new Date().toISOString();
     try {
+      console.log(`🌱 Seed starting: market=${market}`);
+      const { getSeedList } = require('../services/stockUniverse');
+      const lists = getSeedList();
+      console.log(`📋 Seed list loaded: US=${lists.us.length}, SG=${lists.sg.length}`);
+
       const result = await refreshTopStocks(market === 'all' ? null : market);
       lastSeedResult = { ...result, startedAt, finishedAt: new Date().toISOString() };
+      console.log(`✅ Seed complete:`, JSON.stringify(result));
     } catch (e) {
+      console.error('❌ Seed failed with error:', e.message);
+      console.error('Stack:', e.stack);
       lastSeedResult = { error: e.message, startedAt, finishedAt: new Date().toISOString() };
     } finally {
       seedInProgress = false;

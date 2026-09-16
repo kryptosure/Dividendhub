@@ -1,7 +1,7 @@
 const Stock = require('../models/stock');
 const { fetchDividendData, computeDividendMetrics } = require('./yahooFinance');
 const { fetchPayoutRatio } = require('./fmpService');
-const { sleep } = require('../utils/helpers');
+const { getSeedList, getCategoryMap } = require('./stockUniverse');
 
 // ---------- Payout ratio cache (24h TTL) ----------
 const payoutCache = new Map();
@@ -10,22 +10,16 @@ const PAYOUT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 async function getCachedPayoutRatio(symbol) {
   const key = String(symbol || '').toUpperCase().trim();
   if (!key) return null;
-
   const cached = payoutCache.get(key);
-  if (cached && Date.now() - cached.timestamp < PAYOUT_CACHE_TTL_MS) {
-    return cached.value;
-  }
-
+  if (cached && Date.now() - cached.timestamp < PAYOUT_CACHE_TTL_MS) return cached.value;
   const value = await fetchPayoutRatio(key);
   payoutCache.set(key, { value, timestamp: Date.now() });
-
   if (payoutCache.size > 500) {
     const cutoff = Date.now() - PAYOUT_CACHE_TTL_MS;
     for (const [k, v] of payoutCache.entries()) {
       if (v.timestamp < cutoff) payoutCache.delete(k);
     }
   }
-
   return value;
 }
 
@@ -33,14 +27,12 @@ async function getCachedPayoutRatio(symbol) {
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
-
   async function run() {
     while (cursor < items.length) {
       const idx = cursor++;
       results[idx] = await worker(items[idx], idx);
     }
   }
-
   const runners = Array.from({ length: Math.min(limit, items.length) }, run);
   await Promise.all(runners);
   return results;
@@ -53,16 +45,10 @@ async function getStock(symbol, market, type = 'stock') {
 
   const stock = await Stock.findByPk(cleanSymbol);
 
-  // ---------- Cached path (12-hour window) ----------
   if (stock && Date.now() - new Date(stock.lastUpdated).getTime() < 12 * 60 * 60 * 1000) {
     const data = stock.dividendData || {};
-
-    // ✅ Recompute metrics from byYear on every cache hit.
-    // This self-heals stale values left behind by the old (buggy) formula,
-    // without needing to bust the entire cache.
     const metrics = computeDividendMetrics(data.byYear || []);
 
-    // Self-heal payout ratio if missing
     let payoutRatio = data.payoutRatio;
     if (payoutRatio == null) {
       payoutRatio = await getCachedPayoutRatio(cleanSymbol);
@@ -76,30 +62,25 @@ async function getStock(symbol, market, type = 'stock') {
     }
 
     return {
-      symbol: stock.symbol,
-      name: stock.name,
-      market: stock.market,
-      type: stock.type,
+      symbol: stock.symbol, name: stock.name, market: stock.market, type: stock.type,
       currency: data.currency || 'USD',
       currencySymbol: data.currencySymbol || '$',
       totalDividend: parseFloat(stock.totalDividend),
       payoutCount: stock.payoutCount,
-      firstExDate: stock.firstExDate,
-      lastExDate: stock.lastExDate,
+      firstExDate: stock.firstExDate, lastExDate: stock.lastExDate,
       byYear: data.byYear || [],
       currentPrice: parseFloat(stock.currentPrice),
       currentYield: parseFloat(stock.currentYield),
-      dividendCAGR: metrics.dividendCAGR,           // ✅ Recomputed from complete years
-      dividendFrequency: metrics.dividendFrequency, // ✅ NEW
-      dividendStreak: metrics.dividendStreak,       // ✅ NEW
+      dividendCAGR: metrics.dividendCAGR,
+      dividendFrequency: metrics.dividendFrequency,
+      dividendStreak: metrics.dividendStreak,
       trailingAnnualDiv: data.trailingAnnualDiv || null,
-      payoutRatio: payoutRatio,
+      payoutRatio,
       safetyScore: stock.safetyScore,
       exchange: data.exchange || (market === 'sg' ? 'SGX' : 'NASDAQ'),
     };
   }
 
-  // ---------- Fresh fetch path ----------
   const data = await fetchDividendData(cleanSymbol, market);
   if (data.error || data.message) throw new Error(data.error || data.message);
 
@@ -108,17 +89,12 @@ async function getStock(symbol, market, type = 'stock') {
 
   await Stock.upsert({
     symbol: data.symbol || cleanSymbol,
-    name: data.name,
-    market: market,
-    type: type,
+    name: data.name, market: market, type: type,
     dividendData: data,
-    currentPrice: data.currentPrice,
-    currentYield: data.currentYield,
-    safetyScore: data.safetyScore,
-    payoutCount: data.payoutCount,
+    currentPrice: data.currentPrice, currentYield: data.currentYield,
+    safetyScore: data.safetyScore, payoutCount: data.payoutCount,
     totalDividend: data.totalDividend,
-    firstExDate: data.firstExDate,
-    lastExDate: data.lastExDate,
+    firstExDate: data.firstExDate, lastExDate: data.lastExDate,
     lastUpdated: new Date(),
   });
 
@@ -128,7 +104,6 @@ async function getStock(symbol, market, type = 'stock') {
 // ---------- Batch ----------
 async function getBatchStocks(symbols, market) {
   if (!Array.isArray(symbols) || symbols.length === 0) return [];
-
   return mapWithConcurrency(symbols, 3, async (symbol) => {
     try {
       const data = await getStock(symbol, market);
@@ -139,37 +114,53 @@ async function getBatchStocks(symbols, market) {
   });
 }
 
-// ---------- Refresh top stocks & ETFs ----------
-async function refreshTopStocks(market = 'us') {
-  const stockSymbols = market === 'us'
-    ? ['VZ','T','KHC','MO','ABBV','PFE','XOM','CVX','JPM','BAC','WFC','KO','PEP','MCD','MSFT','AAPL','NVDA','JNJ','PG','HD']
-    : ['D05.SI','O39.SI','U11.SI','C6L.SI','Z74.SI','BN4.SI','S63.SI','C52.SI','F34.SI','G13.SI','H78.SI','J36.SI','C07.SI','S68.SI','K71U.SI','A17U.SI','N2IU.SI','C38U.SI','M44U.SI'];
+// ---------- Refresh universe ----------
+async function refreshTopStocks(market, options = {}) {
+  const { onProgress } = options;
+  const targetMarket = market === 'us' || market === 'sg' ? market : null;
 
-  const etfSymbols = market === 'us'
-    ? ['SPY','QQQ','VTI','VOO','IVV','BND','AGG','GLD','SLV','EEM','EFA','IWM','XLK','XLF','XLE','XLI','XLV','XLY','XLP','XLU']
-    : ['ES3.SI','G3B.SI','CFA.SI','O87.SI','M62.SI','N6M.SI','S27.SI','ER7.SI','NS8U.SI','GRN.SI'];
+  const lists = getSeedList();
+  const categoryMap = getCategoryMap();
+  const job = [];
 
-  await Stock.destroy({ where: { market } });
-
-  for (const symbol of stockSymbols) {
-    try {
-      await getStock(symbol, market, 'stock');
-      await sleep(200);
-    } catch (e) {
-      console.error(`Failed to refresh stock ${symbol}:`, e.message);
+  if (!targetMarket || targetMarket === 'us') {
+    for (const sym of lists.us) {
+      const isEtf = categoryMap[sym] === 'ETF' || categoryMap[sym] === 'Bond ETF';
+      job.push({ symbol: sym, market: 'us', type: isEtf ? 'etf' : 'stock' });
+    }
+  }
+  if (!targetMarket || targetMarket === 'sg') {
+    for (const sym of lists.sg) {
+      const isEtf = categoryMap[sym] === 'ETF' || categoryMap[sym] === 'Bond ETF';
+      job.push({ symbol: sym, market: 'sg', type: isEtf ? 'etf' : 'stock' });
     }
   }
 
-  for (const symbol of etfSymbols) {
-    try {
-      await getStock(symbol, market, 'etf');
-      await sleep(200);
-    } catch (e) {
-      console.error(`Failed to refresh ETF ${symbol}:`, e.message);
-    }
-  }
+  console.log(`🌱 Seed job: ${job.length} tickers total (US: ${lists.us.length}, SG: ${lists.sg.length})`);
 
-  console.log(`✅ Refreshed top stocks and ETFs for ${market}`);
+  let updated = 0;
+  let failed = 0;
+  const failedSymbols = [];
+
+  await mapWithConcurrency(job, 3, async ({ symbol, market: m, type }) => {
+    try {
+      await getStock(symbol, m, type);
+      updated++;
+      if (onProgress && updated % 25 === 0) {
+        onProgress({ updated, failed, total: job.length });
+      }
+    } catch (e) {
+      failed++;
+      failedSymbols.push(symbol);
+      console.warn(`Seed failed for ${symbol}:`, e.message);
+    }
+  });
+
+  console.log(`✅ Refreshed ${updated} stocks, ${failed} failed (${job.length} total)`);
+  if (failedSymbols.length > 0 && failedSymbols.length <= 20) {
+    console.log(`Failed tickers: ${failedSymbols.join(', ')}`);
+  }
+  return { updated, failed, total: job.length };
 }
 
 module.exports = { getStock, getBatchStocks, refreshTopStocks, getCachedPayoutRatio };

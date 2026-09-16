@@ -17,7 +17,6 @@ const limiter = rateLimit({
   message: { error: 'Too many requests. Please try again later.' },
 });
 
-// ---------- HARDCODED FALLBACK for common names ----------
 const FALLBACK_MAP = {
   us: {
     'apple': [{ symbol: 'AAPL', name: 'Apple Inc.', exchange: 'NASDAQ' }],
@@ -47,7 +46,7 @@ const FALLBACK_MAP = {
   }
 };
 
-// ---------- Search (Combined DB + Live API Merging) ----------
+// ---------- Search ----------
 router.get('/search', limiter, async (req, res) => {
   const q = String(req.query.q || '').trim();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -126,10 +125,8 @@ router.get('/search', limiter, async (req, res) => {
 });
 
 // ================================================================
-// SCREENER — filters by frequency, asset type, market, safety
-// MUST be defined before /:symbol so it doesn't get caught as a ticker
+// SCREENER
 // ================================================================
-
 const screenerCache = new Map();
 const SCREENER_CACHE_TTL_MS = 15 * 60 * 1000;
 
@@ -158,17 +155,14 @@ router.get('/screener', limiter, async (req, res) => {
       return res.json(cached.data);
     }
 
-    // ---------- 1. Load stock universe ----------
     const markets = market === 'both' ? ['us', 'sg'] : [market];
     const allStocks = await Stock.findAll({ where: { market: markets } });
 
-    // ---------- 2. Enrich ----------
     const searchLower = String(search || '').trim().toLowerCase();
 
     const enriched = [];
     for (const s of allStocks) {
       const data = s.dividendData || {};
-
       const totalDividend = parseFloat(s.totalDividend) || 0;
       const payoutCount = s.payoutCount || 0;
       if (totalDividend <= 0 || payoutCount === 0) continue;
@@ -177,12 +171,9 @@ router.get('/screener', limiter, async (req, res) => {
       if (!freq) continue;
 
       const asset = classifyAssetType(s.symbol, s.name, s.type);
-
       const currentYield = parseFloat(s.currentYield) || 0;
       const currentPrice = parseFloat(s.currentPrice) || 0;
       const dividendCAGR = data.dividendCAGR != null ? Number(data.dividendCAGR) : null;
-      const dividendStreak = data.dividendStreak != null ? Number(data.dividendStreak) : 0;
-      const payoutRatio = data.payoutRatio != null ? Number(data.payoutRatio) : null;
 
       enriched.push({
         symbol: s.symbol,
@@ -194,9 +185,7 @@ router.get('/screener', limiter, async (req, res) => {
         paymentsPerYear: freq.paymentsPerYear,
         currentPrice,
         currentYield,
-        payoutRatio,
         dividendCAGR,
-        dividendStreak,
         safetyScore: s.safetyScore || 'Caution',
         lastExDate: s.lastExDate,
         totalDividend,
@@ -204,9 +193,7 @@ router.get('/screener', limiter, async (req, res) => {
       });
     }
 
-    // ---------- 3. Apply filters ----------
     let filtered = enriched;
-
     if (frequency !== 'all') {
       filtered = filtered.filter(x => x.frequency.toLowerCase() === frequency.toLowerCase());
     }
@@ -223,7 +210,6 @@ router.get('/screener', limiter, async (req, res) => {
       );
     }
 
-    // ---------- 4. Sort ----------
     const safetyOrder = { Safe: 0, Moderate: 1, Caution: 2 };
     const sorters = {
       'yield-desc': (a, b) => b.currentYield - a.currentYield,
@@ -231,13 +217,11 @@ router.get('/screener', limiter, async (req, res) => {
       'name-asc': (a, b) => a.name.localeCompare(b.name),
       'symbol-asc': (a, b) => a.symbol.localeCompare(b.symbol),
       'frequency-asc': (a, b) => a.frequencyOrder - b.frequencyOrder || b.currentYield - a.currentYield,
-      'streak-desc': (a, b) => b.dividendStreak - a.dividendStreak,
       'cagr-desc': (a, b) => (b.dividendCAGR ?? -999) - (a.dividendCAGR ?? -999),
       'safety-asc': (a, b) => (safetyOrder[a.safetyScore] ?? 99) - (safetyOrder[b.safetyScore] ?? 99) || b.currentYield - a.currentYield,
     };
     filtered.sort(sorters[sort] || sorters['yield-desc']);
 
-    // ---------- 5. Frequency + asset counts ----------
     const countedSet = enriched.filter(x => {
       if (assetType !== 'all') {
         if (x.assetType.toLowerCase().replace(/\s+/g, '-') !== assetType.toLowerCase()) return false;
@@ -268,26 +252,21 @@ router.get('/screener', limiter, async (req, res) => {
       reit: countedSet.filter(x => x.assetType === 'REIT').length,
       etf: countedSet.filter(x => x.assetType === 'ETF').length,
       'bond-etf': countedSet.filter(x => x.assetType === 'Bond ETF').length,
+      preferred: countedSet.filter(x => x.assetType === 'Preferred Stock').length,
     };
 
-    // ---------- 6. Paginate ----------
     const total = filtered.length;
     const lim = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
     const off = Math.max(parseInt(offset) || 0, 0);
     const page = filtered.slice(off, off + lim);
 
     const payload = {
-      total,
-      limit: lim,
-      offset: off,
-      stocks: page,
-      frequencyCounts,
-      assetTypeCounts,
+      total, limit: lim, offset: off,
+      stocks: page, frequencyCounts, assetTypeCounts,
       generatedAt: new Date().toISOString(),
     };
 
     screenerCache.set(cacheKey, { data: payload, timestamp: Date.now() });
-
     if (screenerCache.size > 100) {
       const cutoff = Date.now() - SCREENER_CACHE_TTL_MS;
       for (const [k, v] of screenerCache.entries()) {
@@ -303,9 +282,8 @@ router.get('/screener', limiter, async (req, res) => {
 });
 
 // ================================================================
-// Long-term growth: cache + retry + single-fetch optimization
+// Long-term growth
 // ================================================================
-
 const growthCache = new Map();
 const GROWTH_CACHE_TTL_MS = 30 * 60 * 1000;
 
@@ -323,7 +301,6 @@ async function computeLongTermGrowth(symbol, market, amount) {
   if (!currentPrice) throw new Error('Could not determine current price');
 
   const earliestEpoch = timestamps.length > 0 ? timestamps[0] : null;
-
   const periods = [1, 5, 10, 15, 20, 25, 30];
   const labels = [];
   const noDrip = [];
@@ -344,9 +321,7 @@ async function computeLongTermGrowth(symbol, market, amount) {
         isSinceListing = true;
         sinceListingUsed = true;
       } else {
-        labels.push(null);
-        noDrip.push(null);
-        drip.push(null);
+        labels.push(null); noDrip.push(null); drip.push(null);
         continue;
       }
     }
@@ -358,9 +333,7 @@ async function computeLongTermGrowth(symbol, market, amount) {
     }
 
     if (!buyPrice) {
-      labels.push(null);
-      noDrip.push(null);
-      drip.push(null);
+      labels.push(null); noDrip.push(null); drip.push(null);
       continue;
     }
 
@@ -373,10 +346,7 @@ async function computeLongTermGrowth(symbol, market, amount) {
       const cashFromDiv = simulatedShares * d.amount;
       let reinvestPrice = null;
       for (let i = 0; i < timestamps.length; i++) {
-        if (timestamps[i] > d.epoch) {
-          reinvestPrice = closes[i];
-          break;
-        }
+        if (timestamps[i] > d.epoch) { reinvestPrice = closes[i]; break; }
       }
       if (reinvestPrice && reinvestPrice > 0) {
         simulatedShares += cashFromDiv / reinvestPrice;
@@ -384,7 +354,6 @@ async function computeLongTermGrowth(symbol, market, amount) {
     }
 
     const dripValue = simulatedShares * currentPrice;
-
     labels.push(isSinceListing ? 'Since Listing' : `${yearsAgo}Y Ago`);
     noDrip.push(Math.round(noDripValue * 100) / 100);
     drip.push(Math.round(dripValue * 100) / 100);
@@ -392,9 +361,7 @@ async function computeLongTermGrowth(symbol, market, amount) {
 
   return {
     currencySymbol: market === 'sg' ? 'S$' : '$',
-    labels,
-    noDrip,
-    drip,
+    labels, noDrip, drip,
     _needsRetry: noDrip[0] != null && noDrip[1] == null,
   };
 }
@@ -417,21 +384,17 @@ router.get('/long-term-growth', limiter, async (req, res) => {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const result = await computeLongTermGrowth(symbol, market, amount);
-
       if (!result._needsRetry) {
         const { _needsRetry, ...publicResult } = result;
         growthCache.set(cacheKey, { data: publicResult, timestamp: Date.now() });
-
         if (growthCache.size > 200) {
           const cutoff = Date.now() - GROWTH_CACHE_TTL_MS;
           for (const [k, v] of growthCache.entries()) {
             if (v.timestamp < cutoff) growthCache.delete(k);
           }
         }
-
         return res.json(publicResult);
       }
-
       lastError = new Error('Incomplete data on attempt ' + (attempt + 1));
       if (attempt === 0) await new Promise(r => setTimeout(r, 700));
     } catch (e) {
@@ -448,7 +411,6 @@ router.get('/long-term-growth', limiter, async (req, res) => {
 router.get('/:symbol', limiter, async (req, res) => {
   const { symbol } = req.params;
   const market = String(req.query.market || 'us').toLowerCase();
-
   if (!symbol) return res.status(400).json({ error: 'symbol required' });
 
   try {
@@ -458,14 +420,9 @@ router.get('/:symbol', limiter, async (req, res) => {
         symbol: symbol.toUpperCase(),
         currency: market === 'sg' ? 'SGD' : 'USD',
         currencySymbol: market === 'sg' ? 'S$' : '$',
-        name: '',
-        totalDividend: 0,
-        payoutCount: 0,
-        byYear: [],
+        name: '', totalDividend: 0, payoutCount: 0, byYear: [],
         message: data.message || 'No data found',
-        currentPrice: null,
-        currentYield: null,
-        dividendCAGR: null,
+        currentPrice: null, currentYield: null, dividendCAGR: null,
         safetyScore: 'Caution',
         exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
       });
@@ -477,14 +434,9 @@ router.get('/:symbol', limiter, async (req, res) => {
       symbol: symbol.toUpperCase(),
       currency: market === 'sg' ? 'SGD' : 'USD',
       currencySymbol: market === 'sg' ? 'S$' : '$',
-      name: '',
-      totalDividend: 0,
-      payoutCount: 0,
-      byYear: [],
+      name: '', totalDividend: 0, payoutCount: 0, byYear: [],
       message: e.message || 'Failed to fetch stock data',
-      currentPrice: null,
-      currentYield: null,
-      dividendCAGR: null,
+      currentPrice: null, currentYield: null, dividendCAGR: null,
       safetyScore: 'Caution',
       exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
     });
@@ -500,12 +452,8 @@ router.post('/batch', limiter, async (req, res) => {
   if (symbols.length > 20) {
     return res.status(400).json({ error: 'Maximum 20 symbols per batch request' });
   }
-
   try {
-    const results = await getBatchStocks(
-      symbols.map(s => s.toUpperCase()),
-      market
-    );
+    const results = await getBatchStocks(symbols.map(s => s.toUpperCase()), market);
     res.json(results);
   } catch (e) {
     res.json(symbols.map(s => ({ symbol: s, data: null, error: e.message })));
@@ -516,7 +464,6 @@ router.post('/batch', limiter, async (req, res) => {
 router.get('/top/:market', limiter, async (req, res) => {
   const market = req.params.market || 'us';
   const type = req.query.type || 'stock';
-
   const where = { market };
   if (type !== 'all') where.type = type;
 
@@ -526,11 +473,8 @@ router.get('/top/:market', limiter, async (req, res) => {
       order: [['currentYield', 'DESC']],
       limit: 30,
     });
-
     res.json(stocks.map(s => ({
-      symbol: s.symbol,
-      name: s.name || s.symbol,
-      type: s.type,
+      symbol: s.symbol, name: s.name || s.symbol, type: s.type,
       currentPrice: parseFloat(s.currentPrice) || 0,
       currentYield: parseFloat(s.currentYield) || 0,
       safetyScore: s.safetyScore || '—',
