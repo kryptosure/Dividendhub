@@ -1,19 +1,12 @@
 /* backend/src/services/incomePlanner.js
- * Illustrative income-target portfolio generator.
+ * Sample portfolio generator.
  *
  * NOT investment advice. Educational tool only.
- *
- * Algorithm:
- *   1. Filter universe by market, safety score, payout ratio, streak
- *   2. Compute composite score (yield × safety × growth, weights by profile)
- *   3. Select top N with sector diversification constraints
- *   4. Weight by score, apply position + sector caps iteratively
- *   5. Round to whole shares, compute actual income
  */
 
 const Stock = require('../models/stock');
 
-// ---------- Sector map (fallback for stocks not in Yahoo's assetProfile) ----------
+// ---------- Sector map (fallback when Yahoo doesn't provide one) ----------
 const SECTOR_MAP = {
   // Consumer Staples
   KO: 'Consumer Staples', PEP: 'Consumer Staples', MO: 'Consumer Staples',
@@ -38,25 +31,65 @@ const SECTOR_MAP = {
   // Industrials
   ZIM: 'Industrials', C6L: 'Industrials', BN4: 'Industrials', S63: 'Industrials',
   C52: 'Industrials',
-  // Real Estate (REITs)
+  // Real Estate (REITs + property)
   MPW: 'Real Estate', VICI: 'Real Estate',
   K71U: 'Real Estate', A17U: 'Real Estate', N2IU: 'Real Estate',
   C38U: 'Real Estate', M44U: 'Real Estate', H78: 'Real Estate',
-  J36: 'Real Estate',
+  J36: 'Real Estate', T82U: 'Real Estate', AJBU: 'Real Estate',
+  // Singapore ETFs that are index funds (not REITs)
+  ES3: 'Index Fund', G3B: 'Index Fund',
 };
 
-function getSector(symbol) {
+function getSector(symbol, name) {
   const clean = String(symbol || '').toUpperCase().replace(/\.SI$/, '').split('.')[0];
-  return SECTOR_MAP[clean] || 'Other';
+  if (SECTOR_MAP[clean]) return SECTOR_MAP[clean];
+  const n = String(name || '').toLowerCase();
+  if (n.includes('reit')) return 'Real Estate';
+  if (n.includes('bond') || n.includes('treasury') || n.includes('aggregate')) return 'Fixed Income';
+  if (n.includes(' etf') || n.includes('trust')) return 'Index Fund';
+  return 'Other';
+}
+
+// ---------- Bond ETF exclusion (Issue 1 fix) ----------
+// These pay interest, not dividends. Different tax treatment. Wrong for income planning.
+const BOND_ETF_TICKERS = new Set([
+  'AGG', 'BND', 'TLT', 'IEF', 'SHY', 'LQD', 'HYG', 'JNK', 'MUB',
+  'VCIT', 'VCSH', 'BIV', 'BSV', 'BLV', 'GOVT', 'SCHZ', 'FLOT',
+  'USIG', 'IGIB', 'SPIB', 'SPSB', 'SPTI', 'SPTS', 'SPTL',
+  'A35', 'O87', 'N6M', 'S27', 'M62', 'QL3', 'Z74',
+]);
+
+function isBondEtf(symbol, name) {
+  const clean = String(symbol || '').toUpperCase().replace(/\.SI$/, '').split('.')[0];
+  if (BOND_ETF_TICKERS.has(clean)) return true;
+  const n = String(name || '').toLowerCase();
+  if (
+    n.includes(' bond') ||
+    n.includes('treasury') ||
+    n.includes('aggregate bond') ||
+    n.includes('fixed income') ||
+    n.includes('total bond')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// ---------- REIT detection (Issue 2 fix) ----------
+function isReit(symbol, name, sector) {
+  if (sector === 'Real Estate') return true;
+  const n = String(name || '').toLowerCase();
+  if (n.includes('reit')) return true;
+  return false;
 }
 
 // ---------- Risk profiles ----------
 const RISK_PROFILES = {
   conservative: {
     key: 'conservative',
-    label: 'Conservative',
-    tagline: 'Capital preservation first.',
-    description: 'Lower yield, highest quality names only. Prioritises dividend safety over income.',
+    label: 'Safe',
+    tagline: 'Play it safe',
+    description: 'Lower risk, lower income. Steady names only.',
     allowedSafety: ['Safe'],
     minStreak: 10,
     maxPayoutRatio: 80,
@@ -69,8 +102,8 @@ const RISK_PROFILES = {
   balanced: {
     key: 'balanced',
     label: 'Balanced',
-    tagline: 'The middle ground.',
-    description: 'A mix of stability and income. Suitable for most long-term investors.',
+    tagline: 'The middle ground',
+    description: 'A mix of safety and income. Good for most people.',
     allowedSafety: ['Safe', 'Moderate'],
     minStreak: 5,
     maxPayoutRatio: 90,
@@ -83,8 +116,8 @@ const RISK_PROFILES = {
   growth: {
     key: 'growth',
     label: 'Growth',
-    tagline: 'Income with rising dividends.',
-    description: 'Moderate yield with dividend growth as the priority. Lower starting yield, faster compounding.',
+    tagline: 'Small income that grows',
+    description: 'Lower starting income, but the payments grow over time.',
     allowedSafety: ['Safe', 'Moderate'],
     minStreak: 5,
     maxPayoutRatio: 85,
@@ -97,8 +130,8 @@ const RISK_PROFILES = {
   'high-income': {
     key: 'high-income',
     label: 'High Income',
-    tagline: 'Higher yield, higher risk.',
-    description: 'Maximum income. May include stocks with elevated payout ratios or lower safety scores.',
+    tagline: 'Maximum monthly income',
+    description: 'Higher income now, but riskier stocks.',
     allowedSafety: ['Safe', 'Moderate', 'Caution'],
     minStreak: 3,
     maxPayoutRatio: 110,
@@ -110,15 +143,38 @@ const RISK_PROFILES = {
   },
 };
 
-// ---------- Location → markets ----------
 const LOCATION_MARKETS = {
   SG: ['sg'],
   US: ['us'],
   Both: ['us', 'sg'],
 };
 
-// ---------- Safety multipliers ----------
 const SAFETY_MULT = { Safe: 1.0, Moderate: 0.7, Caution: 0.4 };
+
+// ---------- Candidate cache (30 min TTL) ----------
+// Caches the raw stock fetch so repeated requests don't hammer the DB.
+const candidateCache = new Map();
+const CACHE_TTL_MS = 30 * 60 * 1000;
+
+function marketsKey(markets) {
+  return [...markets].sort().join(',');
+}
+
+async function loadCandidates(markets) {
+  const key = marketsKey(markets);
+  const cached = candidateCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.rows;
+  }
+
+  const rows = await Stock.findAll({
+    where: { market: markets },
+    raw: false,
+  });
+
+  candidateCache.set(key, { rows, timestamp: Date.now() });
+  return rows;
+}
 
 // ---------- Main algorithm ----------
 async function generateAllocation({
@@ -126,9 +182,7 @@ async function generateAllocation({
   capital = 0,
   location = 'SG',
   riskProfile = 'balanced',
-  maxPositions,
 }) {
-  // ---------- Validate ----------
   const markets = LOCATION_MARKETS[location];
   if (!markets) throw new Error('Invalid location');
 
@@ -138,11 +192,8 @@ async function generateAllocation({
   if (!isFinite(targetMonthly) || targetMonthly <= 0) throw new Error('targetMonthly must be positive');
   if (capital < 0) throw new Error('capital cannot be negative');
 
-  // ---------- 1. Filter universe ----------
-  const allStocks = await Stock.findAll({
-    where: { market: markets },
-    raw: false,
-  });
+  // ---------- Load candidates (cached) ----------
+  const allStocks = await loadCandidates(markets);
 
   const candidates = [];
   for (const s of allStocks) {
@@ -153,20 +204,37 @@ async function generateAllocation({
     const cagr = data.dividendCAGR != null ? Number(data.dividendCAGR) : null;
     const streak = data.dividendStreak != null ? Number(data.dividendStreak) : 0;
     const price = parseFloat(s.currentPrice) || 0;
+    const sector = getSector(s.symbol, s.name);
 
-    // Hard filters
+    // ✋ Issue 1: hard exclude bond ETFs
+    if (isBondEtf(s.symbol, s.name)) continue;
+    if (sector === 'Fixed Income') continue;
+
+    // Basic sanity
     if (yieldPct <= 0) continue;
     if (price <= 0) continue;
+
+    // Safety filter
     if (!profile.allowedSafety.includes(safety)) continue;
-    if (payoutRatio != null && payoutRatio > profile.maxPayoutRatio) continue;
-    if (cagr != null && cagr < -10) continue; // skip sharply declining dividends
+
+    // ✋ Issue 2: skip payout ratio filter for REITs
+    // REITs are legally required to distribute 90%+ of income, so EPS-based payout
+    // ratios are meaningless for them. Use different rules.
+    const reit = isReit(s.symbol, s.name, sector);
+    if (!reit) {
+      if (payoutRatio != null && payoutRatio > profile.maxPayoutRatio) continue;
+    }
+
+    // Dividend history filters (still apply to everyone)
+    if (cagr != null && cagr < -10) continue;
     if (streak < profile.minStreak) continue;
 
     candidates.push({
       symbol: s.symbol,
       name: s.name || s.symbol,
       market: s.market,
-      sector: getSector(s.symbol),
+      sector,
+      isReit: reit,
       safety,
       currentYield: yieldPct,
       dividendCAGR: cagr != null ? cagr : 0,
@@ -180,23 +248,24 @@ async function generateAllocation({
   if (candidates.length < 5) {
     return {
       ok: false,
-      error: 'Not enough stocks meet your criteria. Try a broader risk profile or a different market.',
-      candidatesCount: candidates.length,
+      error: 'Not enough stocks match your criteria. Try a different risk level or market.',
     };
   }
 
-  // ---------- 2. Score ----------
+  // ---------- Score ----------
   const maxYield = Math.max(...candidates.map(c => c.currentYield), 0.01);
 
   for (const c of candidates) {
     const yieldScore = Math.min(c.currentYield / maxYield, 1);
     const safetyScoreVal = SAFETY_MULT[c.safety] || 0.4;
-    const growthScore = Math.min(Math.max(c.dividendCAGR, 0) / 10, 1); // capped at 10% CAGR
-    const payoutPenalty =
-      c.payoutRatio == null ? 1.0
+    const growthScore = Math.min(Math.max(c.dividendCAGR, 0) / 10, 1);
+
+    // REITs get no payout penalty (their ratios are structurally high)
+    const payoutPenalty = c.isReit ? 1.0
+      : c.payoutRatio == null ? 1.0
         : c.payoutRatio > 100 ? 0.5
-        : c.payoutRatio > 85 ? 0.8
-        : 1.0;
+          : c.payoutRatio > 85 ? 0.8
+            : 1.0;
 
     const w = profile.weights;
     c._score =
@@ -205,14 +274,14 @@ async function generateAllocation({
 
   candidates.sort((a, b) => {
     if (b._score !== a._score) return b._score - a._score;
-    return a.symbol.localeCompare(b.symbol); // deterministic tiebreak
+    return a.symbol.localeCompare(b.symbol);
   });
 
-  // ---------- 3. Select with sector diversification ----------
-  const targetN = maxPositions || profile.targetCount;
+  // ---------- Select with sector diversification ----------
+  const targetN = profile.targetCount;
   const selected = [];
   const sectorCounts = {};
-  const maxPerSector = Math.max(2, Math.floor(targetN * 0.3)); // ~30% max per sector
+  const maxPerSector = Math.max(2, Math.floor(targetN * 0.3));
 
   for (const c of candidates) {
     if (selected.length >= targetN) break;
@@ -222,7 +291,6 @@ async function generateAllocation({
     sectorCounts[c.sector] = sc + 1;
   }
 
-  // If we didn't fill enough slots, do a second pass with relaxed sector caps
   if (selected.length < Math.min(8, targetN)) {
     const picked = new Set(selected.map(s => s.symbol));
     for (const c of candidates) {
@@ -236,30 +304,24 @@ async function generateAllocation({
   if (selected.length < 5) {
     return {
       ok: false,
-      error: 'Could not construct a sufficiently diversified allocation. Try a broader risk profile.',
+      error: 'Could not build a diversified portfolio. Try a different risk level.',
     };
   }
 
-  // ---------- 4. Initial weights from score ----------
+  // ---------- Weights ----------
   const totalScore = selected.reduce((s, c) => s + c._score, 0);
   for (const c of selected) c._weight = c._score / totalScore;
 
-  // ---------- 5. Apply position caps iteratively ----------
   const maxPos = profile.maxPositionPct / 100;
   const maxSec = profile.maxSectorPct / 100;
 
   for (let iter = 0; iter < 8; iter++) {
     let changed = false;
 
-    // Position cap
     for (const c of selected) {
-      if (c._weight > maxPos) {
-        c._weight = maxPos;
-        changed = true;
-      }
+      if (c._weight > maxPos) { c._weight = maxPos; changed = true; }
     }
 
-    // Sector cap
     const bySector = {};
     for (const c of selected) {
       bySector[c.sector] = (bySector[c.sector] || 0) + c._weight;
@@ -267,30 +329,22 @@ async function generateAllocation({
     for (const c of selected) {
       const secTotal = bySector[c.sector];
       if (secTotal > maxSec) {
-        const factor = maxSec / secTotal;
-        c._weight *= factor;
+        c._weight *= maxSec / secTotal;
         changed = true;
       }
     }
 
-    // Renormalize
     const sum = selected.reduce((s, c) => s + c._weight, 0);
-    if (sum > 0) {
-      for (const c of selected) c._weight /= sum;
-    }
-
+    if (sum > 0) for (const c of selected) c._weight /= sum;
     if (!changed) break;
   }
 
-  // ---------- 6. Compute required capital ----------
+  // ---------- Required capital ----------
   const weightedYield = selected.reduce((s, c) => s + c.currentYield * c._weight, 0);
   const requiredCapital = weightedYield > 0 ? (targetMonthly * 12) / (weightedYield / 100) : 0;
-
-  // ---------- 7. Allocation math ----------
-  // Two scenarios: if user provided capital, allocate it. If not, allocate required capital
-  // so they can see what the plan looks like.
   const effectiveCapital = capital > 0 ? capital : requiredCapital;
 
+  // ---------- Allocation math ----------
   const positions = [];
   let totalCost = 0;
   let totalMonthlyIncome = 0;
@@ -300,11 +354,7 @@ async function generateAllocation({
     const targetDollars = effectiveCapital * c._weight;
     const shares = Math.floor(targetDollars / c.currentPrice);
 
-    if (shares <= 0) {
-      // Position too small for one share; skip but note leftover
-      leftoverCash += targetDollars;
-      continue;
-    }
+    if (shares <= 0) { leftoverCash += targetDollars; continue; }
 
     const cost = shares * c.currentPrice;
     const annualIncome = cost * (c.currentYield / 100);
@@ -332,7 +382,6 @@ async function generateAllocation({
     totalMonthlyIncome += monthlyIncome;
   }
 
-  // ---------- 8. Summaries ----------
   const sectorBreakdown = {};
   const safetyBreakdown = { Safe: 0, Moderate: 0, Caution: 0 };
   for (const p of positions) {
@@ -342,22 +391,20 @@ async function generateAllocation({
 
   const avgYield = totalCost > 0 ? (totalMonthlyIncome * 12 / totalCost) * 100 : 0;
 
-  // ---------- 9. Warnings ----------
   const warnings = [];
   if (capital > 0 && totalMonthlyIncome < targetMonthly * 0.9) {
-    warnings.push(`Your provided capital of $${capital.toLocaleString()} generates about $${totalMonthlyIncome.toFixed(2)}/month, which is below your target of $${targetMonthly.toLocaleString()}.`);
+    warnings.push(`Your ${capital.toLocaleString()} would generate about $${totalMonthlyIncome.toFixed(2)}/month — below your goal of $${targetMonthly.toLocaleString()}.`);
   }
-  if (leftoverCash > 0) {
-    warnings.push(`Approximately $${leftoverCash.toFixed(2)} couldn't be allocated (share prices too high for the remaining balance).`);
+  if (leftoverCash > 50) {
+    warnings.push(`About $${leftoverCash.toFixed(2)} couldn't be allocated because some share prices are too high for the remaining amount.`);
   }
   if (positions.length < 8) {
-    warnings.push(`Only ${positions.length} positions could be included. Consider a broader risk profile for better diversification.`);
+    warnings.push(`Only ${positions.length} stocks made the cut. Try "Growth" or "High Income" for more options.`);
   }
   if (riskProfile === 'high-income') {
-    warnings.push('High Income profiles may include stocks with elevated payout ratios. Review each holding carefully.');
+    warnings.push('High Income picks are riskier. Double-check each one before investing.');
   }
 
-  // ---------- 10. Return ----------
   return {
     ok: true,
     inputs: { targetMonthly, capital, location, riskProfile },
@@ -386,7 +433,7 @@ async function generateAllocation({
     safetyBreakdown,
     warnings,
     disclaimer:
-      'This is a hypothetical illustration based on historical data. It is not investment advice, a recommendation, or a personalised financial plan. DividendBro is not licensed under the Financial Advisers Act (Singapore). Past performance is not indicative of future results. Dividends are not guaranteed and may be reduced or eliminated at any time. Conduct your own due diligence and consult a licensed financial adviser before making any investment decisions.',
+      'This is a sample portfolio for learning purposes only. It is not investment advice, a recommendation, or a personalised plan. DividendBro is not licensed under the Financial Advisers Act (Singapore). Past performance does not predict future results. Dividends can be cut or stopped at any time. Always do your own research or speak to a licensed financial adviser before investing.',
   };
 }
 
