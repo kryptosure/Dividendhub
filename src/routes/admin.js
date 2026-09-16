@@ -1,32 +1,29 @@
 const express = require('express');
 const Stock = require('../models/stock');
 const yahooFinance = require('yahoo-finance2');
+const { refreshTopStocks } = require('../services/stockService');
 
 const router = express.Router();
 
-// Refresh top stocks
+// ---------- Legacy: small curated refresh ----------
 router.post('/refresh', async (req, res) => {
   try {
-    // US Top Dividend Stocks
     const usSymbols = [
-      'ZIM', 'MO', 'VZ', 'PFE', 'ABBV', 'T', 'IBM', 
+      'ZIM', 'MO', 'VZ', 'PFE', 'ABBV', 'T', 'IBM',
       'KMI', 'ET', 'MPW', 'VICI', 'F', 'NEE', 'DUK',
       'JPM', 'BAC', 'C', 'WFC', 'GS', 'MS',
       'PG', 'JNJ', 'MRK', 'KO', 'PEP', 'MCD', 'WMT'
     ];
 
     let updatedCount = 0;
-    
+
     for (const symbol of usSymbols) {
       try {
         const quote = await yahooFinance.quote(symbol);
-        
-        // Calculate dividend yield
         const annualDividend = quote.trailingAnnualDividendRate || 0;
         const yield_ = quote.regularMarketPrice ? (annualDividend / quote.regularMarketPrice * 100) : 0;
 
-        // Find or create stock
-        const [stock, created] = await Stock.upsert({
+        await Stock.upsert({
           symbol: symbol,
           name: quote.longName || quote.shortName || symbol,
           currentPrice: quote.regularMarketPrice || 0,
@@ -36,9 +33,6 @@ router.post('/refresh', async (req, res) => {
         });
 
         updatedCount++;
-        console.log(`Updated ${symbol}: $${quote.regularMarketPrice}, yield: ${yield_.toFixed(2)}%`);
-        
-        // Rate limit - wait 1 second between requests
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (err) {
         console.error(`Error updating ${symbol}:`, err.message);
@@ -50,11 +44,51 @@ router.post('/refresh', async (req, res) => {
       message: `Updated ${updatedCount} US stocks`,
       updated: updatedCount
     });
-
   } catch (error) {
     console.error('Error refreshing stocks:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ---------- Full universe seed (background job) ----------
+let seedInProgress = false;
+let lastSeedResult = null;
+
+router.post('/seed-universe', async (req, res) => {
+  if (seedInProgress) {
+    return res.status(409).json({ error: 'Seed already in progress', lastSeedResult });
+  }
+
+  const market = req.query.market || 'all'; // 'all', 'us', or 'sg'
+  seedInProgress = true;
+  lastSeedResult = null;
+
+  // Fire and forget — return immediately
+  (async () => {
+    const startedAt = new Date().toISOString();
+    try {
+      const result = await refreshTopStocks(market === 'all' ? null : market);
+      lastSeedResult = { ...result, startedAt, finishedAt: new Date().toISOString() };
+    } catch (e) {
+      lastSeedResult = { error: e.message, startedAt, finishedAt: new Date().toISOString() };
+    } finally {
+      seedInProgress = false;
+    }
+  })();
+
+  res.json({
+    success: true,
+    message: 'Universe seed started in background. Check /api/admin/seed-status for progress.',
+  });
+});
+
+router.get('/seed-status', async (req, res) => {
+  const total = await Stock.count();
+  res.json({
+    inProgress: seedInProgress,
+    lastResult: lastSeedResult,
+    totalStocksInDB: total,
+  });
 });
 
 module.exports = router;
