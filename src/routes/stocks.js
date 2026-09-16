@@ -5,6 +5,11 @@ const { Op } = require('sequelize');
 const Stock = require('../models/stock');
 const { getStock, getBatchStocks } = require('../services/stockService');
 const { yahooSearch, fetchDividendsRaw, fetchPricesRaw } = require('../services/yahooFinance');
+const {
+  classifyAssetType,
+  computeFrequency,
+  FREQUENCY_ORDER,
+} = require('../services/stockClassifier');
 
 const limiter = rateLimit({
   windowMs: 60 * 1000,
@@ -121,22 +126,194 @@ router.get('/search', limiter, async (req, res) => {
 });
 
 // ================================================================
+// SCREENER — filters by frequency, asset type, market, safety
+// MUST be defined before /:symbol so it doesn't get caught as a ticker
+// ================================================================
+
+const screenerCache = new Map();
+const SCREENER_CACHE_TTL_MS = 15 * 60 * 1000;
+
+function screenerCacheKey(params) {
+  return JSON.stringify(params);
+}
+
+router.get('/screener', limiter, async (req, res) => {
+  try {
+    const {
+      market = 'both',
+      frequency = 'all',
+      assetType = 'all',
+      safety = 'all',
+      search = '',
+      sort = 'yield-desc',
+      limit = 100,
+      offset = 0,
+    } = req.query;
+
+    const cacheKey = screenerCacheKey({
+      market, frequency, assetType, safety, search, sort, limit, offset,
+    });
+    const cached = screenerCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < SCREENER_CACHE_TTL_MS) {
+      return res.json(cached.data);
+    }
+
+    // ---------- 1. Load stock universe ----------
+    const markets = market === 'both' ? ['us', 'sg'] : [market];
+    const allStocks = await Stock.findAll({ where: { market: markets } });
+
+    // ---------- 2. Enrich ----------
+    const searchLower = String(search || '').trim().toLowerCase();
+
+    const enriched = [];
+    for (const s of allStocks) {
+      const data = s.dividendData || {};
+
+      const totalDividend = parseFloat(s.totalDividend) || 0;
+      const payoutCount = s.payoutCount || 0;
+      if (totalDividend <= 0 || payoutCount === 0) continue;
+
+      const freq = computeFrequency(data.byYear);
+      if (!freq) continue;
+
+      const asset = classifyAssetType(s.symbol, s.name, s.type);
+
+      const currentYield = parseFloat(s.currentYield) || 0;
+      const currentPrice = parseFloat(s.currentPrice) || 0;
+      const dividendCAGR = data.dividendCAGR != null ? Number(data.dividendCAGR) : null;
+      const dividendStreak = data.dividendStreak != null ? Number(data.dividendStreak) : 0;
+      const payoutRatio = data.payoutRatio != null ? Number(data.payoutRatio) : null;
+
+      enriched.push({
+        symbol: s.symbol,
+        name: s.name || s.symbol,
+        market: s.market,
+        assetType: asset,
+        frequency: freq.label,
+        frequencyOrder: FREQUENCY_ORDER[freq.label] ?? 99,
+        paymentsPerYear: freq.paymentsPerYear,
+        currentPrice,
+        currentYield,
+        payoutRatio,
+        dividendCAGR,
+        dividendStreak,
+        safetyScore: s.safetyScore || 'Caution',
+        lastExDate: s.lastExDate,
+        totalDividend,
+        payoutCount,
+      });
+    }
+
+    // ---------- 3. Apply filters ----------
+    let filtered = enriched;
+
+    if (frequency !== 'all') {
+      filtered = filtered.filter(x => x.frequency.toLowerCase() === frequency.toLowerCase());
+    }
+    if (assetType !== 'all') {
+      filtered = filtered.filter(x => x.assetType.toLowerCase().replace(/\s+/g, '-') === assetType.toLowerCase());
+    }
+    if (safety !== 'all') {
+      filtered = filtered.filter(x => x.safetyScore.toLowerCase() === safety.toLowerCase());
+    }
+    if (searchLower) {
+      filtered = filtered.filter(x =>
+        x.symbol.toLowerCase().includes(searchLower) ||
+        x.name.toLowerCase().includes(searchLower)
+      );
+    }
+
+    // ---------- 4. Sort ----------
+    const safetyOrder = { Safe: 0, Moderate: 1, Caution: 2 };
+    const sorters = {
+      'yield-desc': (a, b) => b.currentYield - a.currentYield,
+      'yield-asc': (a, b) => a.currentYield - b.currentYield,
+      'name-asc': (a, b) => a.name.localeCompare(b.name),
+      'symbol-asc': (a, b) => a.symbol.localeCompare(b.symbol),
+      'frequency-asc': (a, b) => a.frequencyOrder - b.frequencyOrder || b.currentYield - a.currentYield,
+      'streak-desc': (a, b) => b.dividendStreak - a.dividendStreak,
+      'cagr-desc': (a, b) => (b.dividendCAGR ?? -999) - (a.dividendCAGR ?? -999),
+      'safety-asc': (a, b) => (safetyOrder[a.safetyScore] ?? 99) - (safetyOrder[b.safetyScore] ?? 99) || b.currentYield - a.currentYield,
+    };
+    filtered.sort(sorters[sort] || sorters['yield-desc']);
+
+    // ---------- 5. Frequency + asset counts ----------
+    const countedSet = enriched.filter(x => {
+      if (assetType !== 'all') {
+        if (x.assetType.toLowerCase().replace(/\s+/g, '-') !== assetType.toLowerCase()) return false;
+      }
+      if (safety !== 'all') {
+        if (x.safetyScore.toLowerCase() !== safety.toLowerCase()) return false;
+      }
+      if (searchLower) {
+        if (!x.symbol.toLowerCase().includes(searchLower) && !x.name.toLowerCase().includes(searchLower)) return false;
+      }
+      return true;
+    });
+
+    const frequencyCounts = {
+      all: countedSet.length,
+      daily: countedSet.filter(x => x.frequency === 'Daily').length,
+      weekly: countedSet.filter(x => x.frequency === 'Weekly').length,
+      'bi-weekly': countedSet.filter(x => x.frequency === 'Bi-Weekly').length,
+      monthly: countedSet.filter(x => x.frequency === 'Monthly').length,
+      quarterly: countedSet.filter(x => x.frequency === 'Quarterly').length,
+      'semi-annual': countedSet.filter(x => x.frequency === 'Semi-Annual').length,
+      annual: countedSet.filter(x => x.frequency === 'Annual').length,
+    };
+
+    const assetTypeCounts = {
+      all: countedSet.length,
+      stock: countedSet.filter(x => x.assetType === 'Stock').length,
+      reit: countedSet.filter(x => x.assetType === 'REIT').length,
+      etf: countedSet.filter(x => x.assetType === 'ETF').length,
+      'bond-etf': countedSet.filter(x => x.assetType === 'Bond ETF').length,
+    };
+
+    // ---------- 6. Paginate ----------
+    const total = filtered.length;
+    const lim = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
+    const off = Math.max(parseInt(offset) || 0, 0);
+    const page = filtered.slice(off, off + lim);
+
+    const payload = {
+      total,
+      limit: lim,
+      offset: off,
+      stocks: page,
+      frequencyCounts,
+      assetTypeCounts,
+      generatedAt: new Date().toISOString(),
+    };
+
+    screenerCache.set(cacheKey, { data: payload, timestamp: Date.now() });
+
+    if (screenerCache.size > 100) {
+      const cutoff = Date.now() - SCREENER_CACHE_TTL_MS;
+      for (const [k, v] of screenerCache.entries()) {
+        if (v.timestamp < cutoff) screenerCache.delete(k);
+      }
+    }
+
+    res.json(payload);
+  } catch (e) {
+    console.error('Screener error:', e);
+    res.status(500).json({ error: 'Failed to load screener' });
+  }
+});
+
+// ================================================================
 // Long-term growth: cache + retry + single-fetch optimization
 // ================================================================
 
 const growthCache = new Map();
-const GROWTH_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const GROWTH_CACHE_TTL_MS = 30 * 60 * 1000;
 
-// Extract to a helper so we can retry on incomplete data
 async function computeLongTermGrowth(symbol, market, amount) {
-  // ✅ Single fetch covering both current price + 32Y history.
-  // Previously this endpoint made TWO fetchPricesRaw calls; combining
-  // them halves Yahoo load and reduces the chance of throttling.
   const thirtyTwoYearsAgo = Math.floor(Date.now() / 1000) - (32 * 365 * 86400);
   const { meta, timestamps, closes } = await fetchPricesRaw(symbol, thirtyTwoYearsAgo);
   const { dividends } = await fetchDividendsRaw(symbol, market);
 
-  // Extract current price from meta (fallback: last non-null close)
   let currentPrice = meta.regularMarketPrice;
   if (!isFinite(currentPrice) || currentPrice == null) {
     for (let i = closes.length - 1; i >= 0; i--) {
@@ -218,13 +395,10 @@ async function computeLongTermGrowth(symbol, market, amount) {
     labels,
     noDrip,
     drip,
-    // Internal signal: if the 5Y slot is null but the 1Y slot is present,
-    // we probably got partial data from Yahoo and should retry.
     _needsRetry: noDrip[0] != null && noDrip[1] == null,
   };
 }
 
-// ✅ UPDATED: Historical Long-Term Growth with cache + retry
 router.get('/long-term-growth', limiter, async (req, res) => {
   let symbol = String(req.query.symbol || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -233,25 +407,21 @@ router.get('/long-term-growth', limiter, async (req, res) => {
   if (!symbol) return res.status(400).json({ error: 'symbol required' });
   if (market === 'sg' && !symbol.endsWith('.SI')) symbol += '.SI';
 
-  // ---------- Cache hit ----------
   const cacheKey = `${symbol}:${market}:${amount}`;
   const cached = growthCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < GROWTH_CACHE_TTL_MS) {
     return res.json(cached.data);
   }
 
-  // ---------- Try up to 2 times ----------
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const result = await computeLongTermGrowth(symbol, market, amount);
 
       if (!result._needsRetry) {
-        // Strip the internal signal before returning
         const { _needsRetry, ...publicResult } = result;
         growthCache.set(cacheKey, { data: publicResult, timestamp: Date.now() });
 
-        // Periodic cache cleanup
         if (growthCache.size > 200) {
           const cutoff = Date.now() - GROWTH_CACHE_TTL_MS;
           for (const [k, v] of growthCache.entries()) {
@@ -270,7 +440,6 @@ router.get('/long-term-growth', limiter, async (req, res) => {
     }
   }
 
-  // Both attempts failed
   console.error(`long-term-growth failed for ${symbol}:`, lastError?.message);
   return res.status(500).json({ error: 'Failed to fetch long-term growth data' });
 });
