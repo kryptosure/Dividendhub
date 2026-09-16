@@ -193,6 +193,7 @@ router.get('/screener', limiter, async (req, res) => {
       });
     }
 
+    // ---------- Apply filters to the visible list ----------
     let filtered = enriched;
     if (frequency !== 'all') {
       filtered = filtered.filter(x => x.frequency.toLowerCase() === frequency.toLowerCase());
@@ -210,6 +211,7 @@ router.get('/screener', limiter, async (req, res) => {
       );
     }
 
+    // ---------- Sort ----------
     const safetyOrder = { Safe: 0, Moderate: 1, Caution: 2 };
     const sorters = {
       'yield-desc': (a, b) => b.currentYield - a.currentYield,
@@ -222,7 +224,13 @@ router.get('/screener', limiter, async (req, res) => {
     };
     filtered.sort(sorters[sort] || sorters['yield-desc']);
 
-    const countedSet = enriched.filter(x => {
+    // ================================================================
+    // ✅ Counter sets — each ignores its own filter so the tabs
+    //    reflect what the user WOULD find if they switched.
+    // ================================================================
+
+    // For frequency tab counters: apply asset / safety / search, but NOT frequency
+    const setForFrequencyCounts = enriched.filter(x => {
       if (assetType !== 'all') {
         if (x.assetType.toLowerCase().replace(/\s+/g, '-') !== assetType.toLowerCase()) return false;
       }
@@ -235,26 +243,41 @@ router.get('/screener', limiter, async (req, res) => {
       return true;
     });
 
+    // For asset type tab counters: apply frequency / safety / search, but NOT asset type
+    const setForAssetCounts = enriched.filter(x => {
+      if (frequency !== 'all') {
+        if (x.frequency.toLowerCase() !== frequency.toLowerCase()) return false;
+      }
+      if (safety !== 'all') {
+        if (x.safetyScore.toLowerCase() !== safety.toLowerCase()) return false;
+      }
+      if (searchLower) {
+        if (!x.symbol.toLowerCase().includes(searchLower) && !x.name.toLowerCase().includes(searchLower)) return false;
+      }
+      return true;
+    });
+
     const frequencyCounts = {
-      all: countedSet.length,
-      daily: countedSet.filter(x => x.frequency === 'Daily').length,
-      weekly: countedSet.filter(x => x.frequency === 'Weekly').length,
-      'bi-weekly': countedSet.filter(x => x.frequency === 'Bi-Weekly').length,
-      monthly: countedSet.filter(x => x.frequency === 'Monthly').length,
-      quarterly: countedSet.filter(x => x.frequency === 'Quarterly').length,
-      'semi-annual': countedSet.filter(x => x.frequency === 'Semi-Annual').length,
-      annual: countedSet.filter(x => x.frequency === 'Annual').length,
+      all: setForFrequencyCounts.length,
+      daily: setForFrequencyCounts.filter(x => x.frequency === 'Daily').length,
+      weekly: setForFrequencyCounts.filter(x => x.frequency === 'Weekly').length,
+      'bi-weekly': setForFrequencyCounts.filter(x => x.frequency === 'Bi-Weekly').length,
+      monthly: setForFrequencyCounts.filter(x => x.frequency === 'Monthly').length,
+      quarterly: setForFrequencyCounts.filter(x => x.frequency === 'Quarterly').length,
+      'semi-annual': setForFrequencyCounts.filter(x => x.frequency === 'Semi-Annual').length,
+      annual: setForFrequencyCounts.filter(x => x.frequency === 'Annual').length,
     };
 
     const assetTypeCounts = {
-      all: countedSet.length,
-      stock: countedSet.filter(x => x.assetType === 'Stock').length,
-      reit: countedSet.filter(x => x.assetType === 'REIT').length,
-      etf: countedSet.filter(x => x.assetType === 'ETF').length,
-      'bond-etf': countedSet.filter(x => x.assetType === 'Bond ETF').length,
-      preferred: countedSet.filter(x => x.assetType === 'Preferred Stock').length,
+      all: setForAssetCounts.length,
+      stock: setForAssetCounts.filter(x => x.assetType === 'Stock').length,
+      reit: setForAssetCounts.filter(x => x.assetType === 'REIT').length,
+      etf: setForAssetCounts.filter(x => x.assetType === 'ETF').length,
+      'bond-etf': setForAssetCounts.filter(x => x.assetType === 'Bond ETF').length,
+      preferred: setForAssetCounts.filter(x => x.assetType === 'Preferred Stock').length,
     };
 
+    // ---------- Paginate ----------
     const total = filtered.length;
     const lim = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
     const off = Math.max(parseInt(offset) || 0, 0);
