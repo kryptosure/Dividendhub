@@ -38,6 +38,9 @@ app.use('/api/chat', require('./routes/chat'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/events', require('./routes/events'));
 
+// ✅ NEW: Income Planner routes
+app.use('/api/income-planner', require('./routes/incomePlanner'));
+
 // ---------- /api/search endpoint ----------
 const FALLBACK_MAP = {
   us: {
