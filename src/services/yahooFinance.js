@@ -1,5 +1,6 @@
 const { fetchJson, sleep, currencySymbol, round2, pct, isoOf } = require('../utils/helpers');
-const yahooFinance = require('yahoo-finance2');
+const yahooFinanceLib = require('yahoo-finance2');
+const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
 
 const UA = process.env.YAHOO_FINANCE_UA || 'Mozilla/5.0 (compatible; DividendHub/2.0)';
 

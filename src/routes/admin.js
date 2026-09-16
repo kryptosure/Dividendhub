@@ -1,6 +1,7 @@
 const express = require('express');
 const Stock = require('../models/stock');
-const yahooFinance = require('yahoo-finance2');
+const yahooFinanceLib = require('yahoo-finance2');
+const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
 const { refreshTopStocks } = require('../services/stockService');
 
 const router = express.Router();

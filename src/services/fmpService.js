@@ -12,7 +12,8 @@
  * Returns a percentage (e.g. 45.2) or null.
  */
 
-const yahooFinance = require('yahoo-finance2');
+const yahooFinanceLib = require('yahoo-finance2');
+const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
 const axios = require('axios');
 
 const FMP_API_KEY = process.env.FMP_API_KEY;
