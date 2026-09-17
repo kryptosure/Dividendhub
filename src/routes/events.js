@@ -8,30 +8,31 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Event = require('../models/Event');
 
-// Whitelist of event types we accept
 const ALLOWED_EVENTS = new Set([
+  // Core navigation & discovery
   'page_view',
   'search',
   'view_stock',
-  'add_portfolio',
-  'add_watchlist',
-  'add_compare',
-  'remove_portfolio',
-  'remove_watchlist',
-  'remove_compare',
-  'run_simulator',
-  'export_csv',
-  'export_pdf',
-  'share_whatsapp',
-  'chat_message',
-  'explain_this',
   'view_article',
-  'open_calendar',
-  'open_comparison',
-  'open_portfolio',
-  'open_watchlist',
   'toggle_theme',
   'toggle_market',
+
+  // Portfolio & watchlist
+  'add_portfolio',
+  'remove_portfolio',
+  'add_watchlist',
+  'remove_watchlist',
+  'open_portfolio',
+  'open_watchlist',
+  'open_calendar',
+
+  // Comparison
+  'add_compare',
+  'remove_compare',
+  'open_comparison',
+
+  // Simulators
+  'run_simulator',
   'open_millionaire_simulator',
   'millionaire_autocomplete_select',
   'millionaire_select_from_leaderboard',
@@ -40,6 +41,22 @@ const ALLOWED_EVENTS = new Set([
   'millionaire_share_tweet',
   'millionaire_share_copy',
   'millionaire_share_whatsapp',
+
+  // AI chat
+  'chat_message',
+  'explain_this',
+
+  // Exports & sharing
+  'export_csv',
+  'export_pdf',
+  'share_whatsapp',
+
+  // ✅ NEW: Income Planner
+  'income_planner_generate',
+  'income_planner_save_portfolio',
+
+  // ✅ NEW: Screener
+  'screener_filter',
 ]);
 
 router.post('/', async (req, res) => {
@@ -49,7 +66,6 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'events array required' });
     }
 
-    // Optional auth to attach email
     let userEmail = null;
     const authHeader = req.headers.authorization;
     if (authHeader) {
@@ -60,11 +76,8 @@ router.post('/', async (req, res) => {
       } catch (e) {}
     }
 
-    // ✅ Cloudflare sends the visitor's country as a 2-letter code.
-    // No API calls, no cost. Falls back to null off-Cloudflare (e.g. localhost).
     const country = String(req.headers['cf-ipcountry'] || '').toUpperCase().slice(0, 2) || null;
 
-    // Cap batch size
     const batch = events.slice(0, 50);
 
     const rows = batch

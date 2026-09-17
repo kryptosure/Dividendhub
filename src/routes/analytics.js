@@ -253,6 +253,97 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       raw: true,
     });
 
+    // ---------- 5a. ✅ NEW: Screener filter usage ----------
+    const screenerFilterEvents = await Event.findAll({
+      where: {
+        eventType: 'screener_filter',
+        createdAt: { [Op.gte]: daysAgo(30) },
+      },
+      attributes: ['eventData'],
+      raw: true,
+    });
+
+    const screenerFieldCounts = {};
+    const screenerValueCounts = { frequency: {}, assetType: {}, market: {}, safety: {} };
+    for (const e of screenerFilterEvents) {
+      const field = String(e.eventData?.field || '');
+      const value = String(e.eventData?.value || '');
+      if (field) screenerFieldCounts[field] = (screenerFieldCounts[field] || 0) + 1;
+      if (field && screenerValueCounts[field]) {
+        screenerValueCounts[field][value] = (screenerValueCounts[field][value] || 0) + 1;
+      }
+    }
+
+    const topScreenerFilters = Object.entries(screenerFieldCounts)
+      .map(([field, count]) => ({ field, count }))
+      .sort((a, b) => b.count - a.count);
+
+    const topFrequencyFilters = Object.entries(screenerValueCounts.frequency || {})
+      .map(([value, count]) => ({ value, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8);
+
+    const topAssetFilters = Object.entries(screenerValueCounts.assetType || {})
+      .map(([value, count]) => ({ value, count }))
+      .sort((a, b) => b.count - a.count);
+
+    const screenerSummary = {
+      totalFilterActions: screenerFilterEvents.length,
+      topFilters: topScreenerFilters,
+      topFrequencyFilters,
+      topAssetFilters,
+    };
+
+    // ---------- 5b. ✅ NEW: Income Planner usage ----------
+    const plannerEvents = await Event.findAll({
+      where: {
+        eventType: { [Op.in]: ['income_planner_generate', 'income_planner_save_portfolio'] },
+        createdAt: { [Op.gte]: daysAgo(30) },
+      },
+      attributes: ['eventType', 'eventData'],
+      raw: true,
+    });
+
+    let plannerGenerateCount = 0;
+    let plannerSaveCount = 0;
+    const plannerRiskProfiles = {};
+    const plannerLocations = {};
+    const plannerTargets = {};
+
+    for (const e of plannerEvents) {
+      if (e.eventType === 'income_planner_generate') {
+        plannerGenerateCount += 1;
+        const risk = String(e.eventData?.riskProfile || 'unknown');
+        const loc = String(e.eventData?.location || 'unknown');
+        const target = Number(e.eventData?.targetMonthly) || 0;
+        plannerRiskProfiles[risk] = (plannerRiskProfiles[risk] || 0) + 1;
+        plannerLocations[loc] = (plannerLocations[loc] || 0) + 1;
+        if (target > 0) {
+          const bucket = target >= 2000 ? '$2000+' : target >= 1000 ? '$1000-1999' : target >= 500 ? '$500-999' : 'Under $500';
+          plannerTargets[bucket] = (plannerTargets[bucket] || 0) + 1;
+        }
+      } else if (e.eventType === 'income_planner_save_portfolio') {
+        plannerSaveCount += 1;
+      }
+    }
+
+    const plannerSummary = {
+      generateCount: plannerGenerateCount,
+      saveCount: plannerSaveCount,
+      saveRate: plannerGenerateCount > 0
+        ? Math.round((plannerSaveCount / plannerGenerateCount) * 100)
+        : 0,
+      riskProfiles: Object.entries(plannerRiskProfiles)
+        .map(([key, count]) => ({ key, count }))
+        .sort((a, b) => b.count - a.count),
+      locations: Object.entries(plannerLocations)
+        .map(([key, count]) => ({ key, count }))
+        .sort((a, b) => b.count - a.count),
+      targets: Object.entries(plannerTargets)
+        .map(([key, count]) => ({ key, count }))
+        .sort((a, b) => b.count - a.count),
+    };
+
     // ---------- 6. Top searched tickers ----------
     const searchEvents = await Event.findAll({
       where: { eventType: 'search', createdAt: { [Op.gte]: daysAgo(30) } },
@@ -385,6 +476,9 @@ router.get('/dashboard', adminOnly, async (req, res) => {
       visitorGeography,
       devices,
       featureUsage,
+      // ✅ NEW sections
+      screener: screenerSummary,
+      planner: plannerSummary,
       topSearches,
       topViewed,
       chat: chatBreakdown,
