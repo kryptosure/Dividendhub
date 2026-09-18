@@ -36,11 +36,27 @@ function categoryMap() {
   return _categoryMap;
 }
 
+// ✅ FIX (CA): strip exchange suffixes (.SI, .TO, .V, .NS, .BO, .L) AND
+// trust-unit markers (.UN / -UN) so Canadian symbols like SRU.UN.TO
+// resolve down to their base ticker, matching the KNOWN_* sets and
+// the category map's US/SG keys.
+function cleanSymbol(symbol) {
+  return String(symbol || '')
+    .toUpperCase()
+    .replace(/\.(SI|TO|V|NS|BO|L)$/, '')
+    .replace(/[.-]UN$/, '')
+    .split('.')[0];
+}
+
 function classifyAssetType(symbol, name, typeField) {
-  const clean = String(symbol || '').toUpperCase().replace(/\.SI$/, '').split('.')[0];
+  const upper = String(symbol || '').toUpperCase();
+  const clean = cleanSymbol(symbol);
   const n = String(name || '').toLowerCase();
 
-  const mapped = categoryMap()[clean];
+  // ✅ FIX (CA): try full symbol first (Canada map uses full-symbol keys
+  // like 'SRU.UN.TO'), then fall back to the cleaned base symbol for
+  // US / SG where the map is keyed by plain ticker.
+  const mapped = categoryMap()[upper] || categoryMap()[clean];
   if (mapped) return mapped;
 
   if (PREFERRED_STOCK_TICKERS.has(clean)) return 'Preferred Stock';

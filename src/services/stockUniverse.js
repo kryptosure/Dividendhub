@@ -1,6 +1,7 @@
 /* backend/src/services/stockUniverse.js
- * Full dividend universe — ~600 tickers, organized by frequency tier.
+ * Full dividend universe — ~670 tickers, organized by frequency tier.
  * Includes daily/weekly/monthly high-frequency ETFs and preferred stocks.
+ * Now includes Canada (TSX) — see the `ca` block at the bottom.
  */
 
 const UNIVERSE = {
@@ -133,6 +134,37 @@ const UNIVERSE = {
       'N6M.SI', 'Z97.SI',
     ],
   },
+
+  // ✅ Canada — TSX dividend payers (Phase 1).
+  // Trust units (REITs) use DASH format: SRU-UN.TO, not SRU.UN.TO.
+  // Verified against probe-canada-results.json (2026-09-18):
+  //   .UN.TO variants → HTTP 404
+  //   -UN.TO variants → 100–390 dividend payments each, monthly frequency
+  ca: {
+    // ---------- MONTHLY-PAYING STOCKS (REITs + royalty) ----------
+    monthlyStocks: [
+      'SRU-UN.TO', 'REI-UN.TO', 'GRT-UN.TO', 'CRT-UN.TO',
+      'CRR-UN.TO', 'DIR-UN.TO', 'VITL-UN.TO', 'CHP-UN.TO',
+      'FRU.TO', 'WCP.TO', 'DIV.TO',
+    ],
+
+    // ---------- QUARTERLY-PAYING DIVIDEND STOCKS ----------
+    stocks: [
+      // Big Six banks
+      'RY.TO', 'TD.TO', 'BNS.TO', 'BMO.TO', 'CM.TO', 'NA.TO',
+      // Energy & pipelines
+      'ENB.TO', 'TRP.TO', 'PPL.TO', 'SU.TO', 'CNQ.TO',
+      // Utilities & telecom
+      'FTS.TO', 'CU.TO', 'T.TO', 'BCE.TO',
+      // Other
+      'EIF.TO',
+    ],
+
+    // ---------- QUARTERLY-PAYING DIVIDEND ETFs ----------
+    etfs: [
+      'PDC.TO', 'DXC.TO',
+    ],
+  },
 };
 
 function getSeedList() {
@@ -150,9 +182,15 @@ function getSeedList() {
     ...UNIVERSE.sg.reits,
     ...UNIVERSE.sg.etfs,
   ];
+  const ca = [
+    ...UNIVERSE.ca.monthlyStocks,
+    ...UNIVERSE.ca.stocks,
+    ...UNIVERSE.ca.etfs,
+  ];
   return {
     us: [...new Set(us)],
     sg: [...new Set(sg)],
+    ca: [...new Set(ca)],
   };
 }
 
@@ -170,8 +208,20 @@ function getCategoryMap() {
   }
   for (const ticker of UNIVERSE.us.etfs) map[ticker] = 'ETF';
   for (const ticker of UNIVERSE.us.bondEtfs) map[ticker] = 'Bond ETF';
+
   for (const ticker of UNIVERSE.sg.reits) map[ticker] = 'REIT';
   for (const ticker of UNIVERSE.sg.etfs) map[ticker] = 'ETF';
+
+  // ✅ Canada — full-symbol keys ('SRU-UN.TO').
+  // The classifier tries the full symbol first, so this works.
+  // Regex matches both '-' and '.' before UN.TO so it survives
+  // a future Yahoo format flip.
+  for (const ticker of UNIVERSE.ca.monthlyStocks) {
+    map[ticker] = /[-.]UN\.TO$/.test(ticker) ? 'REIT' : 'Stock';
+  }
+  for (const ticker of UNIVERSE.ca.stocks) map[ticker] = 'Stock';
+  for (const ticker of UNIVERSE.ca.etfs) map[ticker] = 'ETF';
+
   return map;
 }
 

@@ -117,7 +117,9 @@ async function getBatchStocks(symbols, market) {
 // ---------- Refresh universe ----------
 async function refreshTopStocks(market, options = {}) {
   const { onProgress } = options;
-  const targetMarket = market === 'us' || market === 'sg' ? market : null;
+
+  // ✅ FIX (CA): include 'ca' in the allowed target markets.
+  const targetMarket = ['us', 'sg', 'ca'].includes(market) ? market : null;
 
   const lists = getSeedList();
   const categoryMap = getCategoryMap();
@@ -135,8 +137,15 @@ async function refreshTopStocks(market, options = {}) {
       job.push({ symbol: sym, market: 'sg', type: isEtf ? 'etf' : 'stock' });
     }
   }
+  // ✅ NEW: Canada branch
+  if (!targetMarket || targetMarket === 'ca') {
+    for (const sym of lists.ca) {
+      const isEtf = categoryMap[sym] === 'ETF' || categoryMap[sym] === 'Bond ETF';
+      job.push({ symbol: sym, market: 'ca', type: isEtf ? 'etf' : 'stock' });
+    }
+  }
 
-  console.log(`🌱 Seed job: ${job.length} tickers total (US: ${lists.us.length}, SG: ${lists.sg.length})`);
+  console.log(`🌱 Seed job: ${job.length} tickers total (US: ${lists.us.length}, SG: ${lists.sg.length}, CA: ${lists.ca.length})`);
 
   let updated = 0;
   let failed = 0;

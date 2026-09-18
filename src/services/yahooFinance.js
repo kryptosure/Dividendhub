@@ -4,16 +4,30 @@ const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
 
 const UA = process.env.YAHOO_FINANCE_UA || 'Mozilla/5.0 (compatible; DividendHub/2.0)';
 
+// ✅ FIX (CA): centralize market-aware defaults so Canada gets CAD/TSX
+// instead of silently falling back to USD/NASDAQ.
+function defaultCurrencyFor(market) {
+  if (market === 'sg') return 'SGD';
+  if (market === 'ca') return 'CAD';
+  return 'USD';
+}
+function defaultExchangeFor(market) {
+  if (market === 'sg') return 'SGX';
+  if (market === 'ca') return 'TSX';
+  return 'NASDAQ';
+}
+
 async function fetchDividendsRaw(symbol, market) {
   const now = Math.floor(Date.now() / 1000);
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=0&period2=${now}&interval=1d&events=div`;
   const data = await fetchJson(url);
   const chart = data?.chart;
-  if (!chart) return { currency: 'USD', dividends: [] };
+  if (!chart) return { currency: defaultCurrencyFor(market), dividends: [] };
   if (chart.error) throw new Error(chart.error.description || 'source error');
   const result = chart.result?.[0];
-  if (!result) return { currency: 'USD', dividends: [] };
-  const currency = result.meta?.currency || (market === 'sg' ? 'SGD' : 'USD');
+  if (!result) return { currency: defaultCurrencyFor(market), dividends: [] };
+  // ✅ FIX (CA): use market-aware default rather than hardcoded USD
+  const currency = result.meta?.currency || defaultCurrencyFor(market);
   const divs = result.events?.dividends || {};
   const out = [];
   for (const ts in divs) {
@@ -26,7 +40,10 @@ async function fetchDividendsRaw(symbol, market) {
 
 async function resolveName(symbol, market) {
   try {
-    const results = await yahooSearch(symbol.replace('.SI', ''), market);
+    // ✅ FIX (CA): strip any of .SI / .TO / .V before searching,
+    // not just .SI.
+    const query = symbol.replace(/\.(SI|TO|V)$/, '');
+    const results = await yahooSearch(query, market);
     const match = results.find(r => r.symbol === symbol);
     return match?.longname || match?.shortname || symbol;
   } catch (e) {
@@ -79,7 +96,10 @@ async function fetchSplitsRaw(symbol) {
 }
 
 async function yahooSearch(q, market) {
-  const region = market === 'sg' ? 'SG' : 'US';
+  // ✅ FIX (CA): map market → Yahoo region code, and add a CA branch
+  // that accepts TSX (.TO) and TSXV (.V) listings.
+  const regionMap = { sg: 'SG', ca: 'CA', us: 'US' };
+  const region = regionMap[market] || 'US';
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=24&newsCount=0&lang=en-US&region=${region}`;
 
   const data = await fetchJson(url);
@@ -92,6 +112,12 @@ async function yahooSearch(q, market) {
       String(x.symbol || '').toUpperCase().endsWith('.SI') &&
       ['EQUITY', 'MUTUALFUND', 'ETF', 'TRUST'].includes(x.quoteType)
     );
+  } else if (market === 'ca') {
+    // ✅ NEW: TSX / TSXV listings only
+    filtered = quotes.filter(x =>
+      /\.(TO|V)$/i.test(String(x.symbol || '')) &&
+      ['EQUITY', 'ETF', 'MUTUALFUND', 'TRUST'].includes(x.quoteType)
+    );
   } else {
     filtered = quotes.filter(x =>
       ['EQUITY', 'ETF'].includes(x.quoteType) &&
@@ -103,21 +129,14 @@ async function yahooSearch(q, market) {
     symbol: x.symbol,
     shortname: x.shortname || x.symbol,
     longname: x.longname || x.shortname || '',
-    exchange: x.exchange || (market === 'sg' ? 'SGX' : 'NASDAQ')
+    // ✅ FIX (CA): market-aware exchange fallback
+    exchange: x.exchange || defaultExchangeFor(market)
   }));
 }
 
 // ================================================================
-// ✅ NEW: Compute dividend metrics from a byYear array.
-//
-// Fixes three data quality bugs:
-//   1. dividendCAGR — only uses COMPLETE years (excludes current partial year)
-//   2. dividendFrequency — mode of last 3 complete years (not current partial)
-//   3. dividendStreak — consecutive years of increase, walking backwards,
-//      stopping at the first year that decreased or at a gap in the calendar.
-//
-// This is called both on fresh fetch AND on cache hit, so old cached
-// entries get corrected without needing a manual cache bust.
+// ✅ Compute dividend metrics from a byYear array.
+// (unchanged — kept as-is for completeness)
 // ================================================================
 function computeDividendMetrics(byYear) {
   const empty = { dividendCAGR: null, dividendFrequency: null, dividendStreak: 0, completeYears: [] };
@@ -125,7 +144,6 @@ function computeDividendMetrics(byYear) {
 
   const currentYear = new Date().getUTCFullYear();
 
-  // Build ascending map and list of complete years (exclude current year, which may be partial)
   const asc = [...byYear].sort((a, b) => a.year - b.year);
   const map = {};
   for (const y of asc) map[y.year] = y;
@@ -175,15 +193,13 @@ function computeDividendMetrics(byYear) {
   }
 
   // ---------- Streak: consecutive years of increase ----------
-  // Walk backwards from the latest complete year. Stop at the first
-  // year where the total decreased, or at a gap in the calendar.
   let dividendStreak = 0;
   if (completeYears.length > 0) {
     dividendStreak = 1;
     for (let i = completeYears.length - 1; i > 0; i--) {
       const curYear = completeYears[i];
       const prevYear = completeYears[i - 1];
-      if (curYear !== prevYear + 1) break; // calendar gap
+      if (curYear !== prevYear + 1) break;
 
       const cur = map[curYear]?.total || 0;
       const prev = map[prevYear]?.total || 0;
@@ -199,14 +215,19 @@ function computeDividendMetrics(byYear) {
 }
 
 async function fetchDividendData(symbol, market) {
+  // ✅ FIX (CA): single source of truth for market-aware defaults
+  const defaultCcy = defaultCurrencyFor(market);
+  const defaultExch = defaultExchangeFor(market);
+
   try {
     const { currency, dividends } = await fetchDividendsRaw(symbol, market);
 
     if (!dividends.length) {
+      const ccy = currency || defaultCcy;
       return {
         symbol,
-        currency: currency || (market === 'sg' ? 'SGD' : 'USD'),
-        currencySymbol: currencySymbol(currency || 'USD', market),
+        currency: ccy,
+        currencySymbol: currencySymbol(ccy, market),
         name: symbol,
         totalDividend: 0,
         payoutCount: 0,
@@ -219,7 +240,7 @@ async function fetchDividendData(symbol, market) {
         dividendStreak: 0,
         payoutRatio: null,
         safetyScore: 'Caution',
-        exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+        exchange: defaultExch,
       };
     }
 
@@ -244,7 +265,6 @@ async function fetchDividendData(symbol, market) {
     const dates = dividends.map(d => isoOf(d.epoch)).sort();
     const name = await resolveName(symbol, market);
 
-    // ✅ Compute corrected metrics (CAGR, frequency, streak) from byYear
     const metrics = computeDividendMetrics(byYear);
 
     let currentPrice = null, currentYield = null, trailingAnnualDiv = 0;
@@ -268,7 +288,7 @@ async function fetchDividendData(symbol, market) {
       }
     } catch (e) { /* skip */ }
 
-    // ---------- Safety score (unchanged logic) ----------
+    // ---------- Safety score (unchanged) ----------
     let safetyScore = 'Caution';
     let payoutRatio = null;
     try {
@@ -312,11 +332,13 @@ async function fetchDividendData(symbol, market) {
       else if (score >= 3) safetyScore = 'Moderate';
     } catch (e) { /* ignore */ }
 
+    const ccy = currency || defaultCcy;
+
     return {
       symbol,
       name,
-      currency: currency || 'USD',
-      currencySymbol: currencySymbol(currency || 'USD', market),
+      currency: ccy,
+      currencySymbol: currencySymbol(ccy, market),
       totalDividend: Math.round(total * 1e6) / 1e6,
       payoutCount: dividends.length,
       firstExDate: dates[0] || null,
@@ -330,14 +352,15 @@ async function fetchDividendData(symbol, market) {
       trailingAnnualDiv,
       payoutRatio: payoutRatio ? Math.round(payoutRatio * 100) / 100 : null,
       safetyScore,
-      exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+      exchange: defaultExch,
     };
   } catch (e) {
     console.error('fetchDividendData error:', e);
+    const ccy = defaultCcy;
     return {
       symbol,
-      currency: market === 'sg' ? 'SGD' : 'USD',
-      currencySymbol: market === 'sg' ? 'S$' : '$',
+      currency: ccy,
+      currencySymbol: currencySymbol(ccy, market),
       name: symbol,
       totalDividend: 0,
       payoutCount: 0,
@@ -350,7 +373,7 @@ async function fetchDividendData(symbol, market) {
       dividendStreak: 0,
       payoutRatio: null,
       safetyScore: 'Caution',
-      exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+      exchange: defaultExch,
     };
   }
 }
@@ -363,5 +386,5 @@ module.exports = {
   fetchSplitsRaw,
   resolveName,
   yahooSearch,
-  computeDividendMetrics, // ✅ NEW
+  computeDividendMetrics,
 };

@@ -1,0 +1,372 @@
+[
+  {
+    "symbol": "RY.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 127,
+    "freq": "quarterly",
+    "last": "2026-07-27",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "TD.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 125,
+    "freq": "quarterly",
+    "last": "2026-07-10",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "BNS.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 126,
+    "freq": "quarterly",
+    "last": "2026-07-07",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "BMO.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 127,
+    "freq": "quarterly",
+    "last": "2026-07-30",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "CM.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 126,
+    "freq": "quarterly",
+    "last": "2026-06-29",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "NA.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 126,
+    "freq": "quarterly",
+    "last": "2026-06-29",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "ENB.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 127,
+    "freq": "quarterly",
+    "last": "2026-08-14",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "TRP.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 126,
+    "freq": "quarterly",
+    "last": "2026-06-30",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "PPL.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 245,
+    "freq": "monthly",
+    "last": "2026-09-15",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "SU.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 127,
+    "freq": "quarterly",
+    "last": "2026-09-04",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "CNQ.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 104,
+    "freq": "quarterly",
+    "last": "2026-09-11",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "FRU.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 272,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "SRU.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "SRU-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 272,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "REI.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "REI-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 390,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "GRT.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "GRT-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 195,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "CRT.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "CRT-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 151,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "CRR.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "CRR-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 246,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "DIR.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "DIR-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 167,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "VITL.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "VITL-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 192,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "CHP.UN.TO",
+    "ccy": null,
+    "ok": false,
+    "divs": 0,
+    "freq": "unknown",
+    "last": null,
+    "payout": null,
+    "note": "HTTP 404"
+  },
+  {
+    "symbol": "CHP-UN.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 157,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "WCP.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 164,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "DIV.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 143,
+    "freq": "monthly",
+    "last": "2026-09-15",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "EIF.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 248,
+    "freq": "monthly",
+    "last": "2026-08-31",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "FTS.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 125,
+    "freq": "quarterly",
+    "last": "2026-08-19",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "CU.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 103,
+    "freq": "quarterly",
+    "last": "2026-08-06",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "T.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 126,
+    "freq": "quarterly",
+    "last": "2026-09-10",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "BCE.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 122,
+    "freq": "quarterly",
+    "last": "2026-09-15",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "PDC.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 175,
+    "freq": "monthly",
+    "last": "2026-08-28",
+    "payout": null,
+    "note": ""
+  },
+  {
+    "symbol": "DXC.TO",
+    "ccy": "CAD",
+    "ok": true,
+    "divs": 112,
+    "freq": "monthly",
+    "last": "2026-08-26",
+    "payout": null,
+    "note": ""
+  }
+]

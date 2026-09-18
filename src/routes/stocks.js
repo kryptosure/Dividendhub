@@ -17,6 +17,28 @@ const limiter = rateLimit({
   message: { error: 'Too many requests. Please try again later.' },
 });
 
+// ✅ FIX (CA): centralize market → exchange default so we don't hardcode
+// NASDAQ everywhere. Used in search results and error payloads below.
+function defaultExchangeFor(market) {
+  if (market === 'sg') return 'SGX';
+  if (market === 'ca') return 'TSX';
+  return 'NASDAQ';
+}
+
+// ✅ FIX (CA): same idea for currency symbol. C$ disambiguates CAD from USD.
+function defaultCurrencySymbolFor(market) {
+  if (market === 'sg') return 'S$';
+  if (market === 'ca') return 'C$';
+  return '$';
+}
+
+// ✅ FIX (CA): currency code fallback for error payloads.
+function defaultCurrencyFor(market) {
+  if (market === 'sg') return 'SGD';
+  if (market === 'ca') return 'CAD';
+  return 'USD';
+}
+
 const FALLBACK_MAP = {
   us: {
     'apple': [{ symbol: 'AAPL', name: 'Apple Inc.', exchange: 'NASDAQ' }],
@@ -43,7 +65,21 @@ const FALLBACK_MAP = {
     'keppel': [{ symbol: 'BN4.SI', name: 'Keppel Corp', exchange: 'SGX' }],
     'es3': [{ symbol: 'ES3.SI', name: 'SPDR Straits Times Index ETF', exchange: 'SGX' }],
     'g3b': [{ symbol: 'G3B.SI', name: 'Nikko AM Singapore STI ETF', exchange: 'SGX' }],
-  }
+  },
+  // ✅ NEW: Canada fallback — used only when both Yahoo and DB search return nothing.
+  ca: {
+    'royal bank': [{ symbol: 'RY.TO', name: 'Royal Bank of Canada', exchange: 'TSX' }],
+    'rbc': [{ symbol: 'RY.TO', name: 'Royal Bank of Canada', exchange: 'TSX' }],
+    'td': [{ symbol: 'TD.TO', name: 'Toronto-Dominion Bank', exchange: 'TSX' }],
+    'enbridge': [{ symbol: 'ENB.TO', name: 'Enbridge Inc.', exchange: 'TSX' }],
+    'tc energy': [{ symbol: 'TRP.TO', name: 'TC Energy Corporation', exchange: 'TSX' }],
+    'bmo': [{ symbol: 'BMO.TO', name: 'Bank of Montreal', exchange: 'TSX' }],
+    'scotiabank': [{ symbol: 'BNS.TO', name: 'Bank of Nova Scotia', exchange: 'TSX' }],
+    'cibc': [{ symbol: 'CM.TO', name: 'Canadian Imperial Bank of Commerce', exchange: 'TSX' }],
+    'fortis': [{ symbol: 'FTS.TO', name: 'Fortis Inc.', exchange: 'TSX' }],
+    'bce': [{ symbol: 'BCE.TO', name: 'BCE Inc.', exchange: 'TSX' }],
+    'telus': [{ symbol: 'T.TO', name: 'TELUS Corporation', exchange: 'TSX' }],
+  },
 };
 
 // ---------- Search ----------
@@ -64,7 +100,8 @@ router.get('/search', limiter, async (req, res) => {
           symbol: item.symbol,
           shortname: item.shortname || item.symbol,
           longname: item.longname || item.shortname || item.symbol,
-          exchange: item.exchange || (market === 'sg' ? 'SGX' : 'NASDAQ'),
+          // ✅ FIX (CA): was hardcoding 'NASDAQ' for anything non-SG
+          exchange: item.exchange || defaultExchangeFor(market),
         }));
       }
     } catch (e) {
@@ -86,7 +123,8 @@ router.get('/search', limiter, async (req, res) => {
         symbol: s.symbol,
         shortname: s.name || s.symbol,
         longname: s.name || s.symbol,
-        exchange: market === 'sg' ? 'SGX' : 'NASDAQ',
+        // ✅ FIX (CA): was hardcoding 'NASDAQ' / 'SGX'
+        exchange: defaultExchangeFor(market),
       }));
     } catch (e) {
       console.warn('Database search fallback failed:', e.message);
@@ -155,7 +193,9 @@ router.get('/screener', limiter, async (req, res) => {
       return res.json(cached.data);
     }
 
-    const markets = market === 'both' ? ['us', 'sg'] : [market];
+    // ✅ FIX (CA): 'both' now includes Canada. Before this, CA tickers were
+    // invisible on the default screener view (market defaults to 'both').
+    const markets = market === 'both' ? ['us', 'sg', 'ca'] : [market];
     const allStocks = await Stock.findAll({ where: { market: markets } });
 
     const searchLower = String(search || '').trim().toLowerCase();
@@ -229,7 +269,6 @@ router.get('/screener', limiter, async (req, res) => {
     //    reflect what the user WOULD find if they switched.
     // ================================================================
 
-    // For frequency tab counters: apply asset / safety / search, but NOT frequency
     const setForFrequencyCounts = enriched.filter(x => {
       if (assetType !== 'all') {
         if (x.assetType.toLowerCase().replace(/\s+/g, '-') !== assetType.toLowerCase()) return false;
@@ -243,7 +282,6 @@ router.get('/screener', limiter, async (req, res) => {
       return true;
     });
 
-    // For asset type tab counters: apply frequency / safety / search, but NOT asset type
     const setForAssetCounts = enriched.filter(x => {
       if (frequency !== 'all') {
         if (x.frequency.toLowerCase() !== frequency.toLowerCase()) return false;
@@ -383,7 +421,8 @@ async function computeLongTermGrowth(symbol, market, amount) {
   }
 
   return {
-    currencySymbol: market === 'sg' ? 'S$' : '$',
+    // ✅ FIX (CA): C$ for Canadian stocks
+    currencySymbol: defaultCurrencySymbolFor(market),
     labels, noDrip, drip,
     _needsRetry: noDrip[0] != null && noDrip[1] == null,
   };
@@ -441,13 +480,14 @@ router.get('/:symbol', limiter, async (req, res) => {
     if (data.error || data.message) {
       return res.json({
         symbol: symbol.toUpperCase(),
-        currency: market === 'sg' ? 'SGD' : 'USD',
-        currencySymbol: market === 'sg' ? 'S$' : '$',
+        // ✅ FIX (CA)
+        currency: defaultCurrencyFor(market),
+        currencySymbol: defaultCurrencySymbolFor(market),
         name: '', totalDividend: 0, payoutCount: 0, byYear: [],
         message: data.message || 'No data found',
         currentPrice: null, currentYield: null, dividendCAGR: null,
         safetyScore: 'Caution',
-        exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
+        exchange: defaultExchangeFor(market),
       });
     }
     res.json(data);
@@ -455,13 +495,14 @@ router.get('/:symbol', limiter, async (req, res) => {
     console.error('Stock detail error:', e);
     res.json({
       symbol: symbol.toUpperCase(),
-      currency: market === 'sg' ? 'SGD' : 'USD',
-      currencySymbol: market === 'sg' ? 'S$' : '$',
+      // ✅ FIX (CA)
+      currency: defaultCurrencyFor(market),
+      currencySymbol: defaultCurrencySymbolFor(market),
       name: '', totalDividend: 0, payoutCount: 0, byYear: [],
       message: e.message || 'Failed to fetch stock data',
       currentPrice: null, currentYield: null, dividendCAGR: null,
       safetyScore: 'Caution',
-      exchange: market === 'sg' ? 'SGX' : 'NASDAQ'
+      exchange: defaultExchangeFor(market),
     });
   }
 });
