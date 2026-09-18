@@ -7,6 +7,8 @@
 const Stock = require('../models/stock');
 
 // ---------- Sector map (fallback when Yahoo doesn't provide one) ----------
+// Canada entries use the FULL symbol as key because base tickers collide with
+// US ones (e.g. PPL.TO = Pembina Energy vs PPL = PPL Corp Utilities).
 const SECTOR_MAP = {
   // Consumer Staples
   KO: 'Consumer Staples', PEP: 'Consumer Staples', MO: 'Consumer Staples',
@@ -38,11 +40,46 @@ const SECTOR_MAP = {
   J36: 'Real Estate', T82U: 'Real Estate', AJBU: 'Real Estate',
   // Singapore ETFs that are index funds (not REITs)
   ES3: 'Index Fund', G3B: 'Index Fund',
+
+  // ✅ CANADA — full-symbol keys to avoid US collisions
+  'RY.TO': 'Financials',
+  'TD.TO': 'Financials',
+  'BNS.TO': 'Financials',
+  'BMO.TO': 'Financials',
+  'CM.TO': 'Financials',
+  'NA.TO': 'Financials',
+  'ENB.TO': 'Energy',
+  'TRP.TO': 'Energy',
+  'PPL.TO': 'Energy',
+  'SU.TO': 'Energy',
+  'CNQ.TO': 'Energy',
+  'FRU.TO': 'Energy',
+  'WCP.TO': 'Energy',
+  'DIV.TO': 'Energy',
+  'FTS.TO': 'Utilities',
+  'CU.TO': 'Utilities',
+  'T.TO': 'Communication Services',
+  'BCE.TO': 'Communication Services',
+  'EIF.TO': 'Industrials',
+  'SRU-UN.TO': 'Real Estate',
+  'REI-UN.TO': 'Real Estate',
+  'GRT-UN.TO': 'Real Estate',
+  'CRT-UN.TO': 'Real Estate',
+  'CRR-UN.TO': 'Real Estate',
+  'DIR-UN.TO': 'Real Estate',
+  'VITL-UN.TO': 'Real Estate',
+  'CHP-UN.TO': 'Real Estate',
+  'PDC.TO': 'Index Fund',
+  'DXC.TO': 'Index Fund',
 };
 
 function getSector(symbol, name) {
-  const clean = String(symbol || '').toUpperCase().replace(/\.SI$/, '').split('.')[0];
+  const upper = String(symbol || '').toUpperCase();
+  const clean = upper.replace(/\.(SI|TO|V)$/, '').replace(/[.-]UN$/, '').split('.')[0];
+
+  if (SECTOR_MAP[upper]) return SECTOR_MAP[upper];
   if (SECTOR_MAP[clean]) return SECTOR_MAP[clean];
+
   const n = String(name || '').toLowerCase();
   if (n.includes('reit')) return 'Real Estate';
   if (n.includes('bond') || n.includes('treasury') || n.includes('aggregate')) return 'Fixed Income';
@@ -50,8 +87,7 @@ function getSector(symbol, name) {
   return 'Other';
 }
 
-// ---------- Bond ETF exclusion (Issue 1 fix) ----------
-// These pay interest, not dividends. Different tax treatment. Wrong for income planning.
+// ---------- Bond ETF exclusion ----------
 const BOND_ETF_TICKERS = new Set([
   'AGG', 'BND', 'TLT', 'IEF', 'SHY', 'LQD', 'HYG', 'JNK', 'MUB',
   'VCIT', 'VCSH', 'BIV', 'BSV', 'BLV', 'GOVT', 'SCHZ', 'FLOT',
@@ -60,8 +96,9 @@ const BOND_ETF_TICKERS = new Set([
 ]);
 
 function isBondEtf(symbol, name) {
-  const clean = String(symbol || '').toUpperCase().replace(/\.SI$/, '').split('.')[0];
-  if (BOND_ETF_TICKERS.has(clean)) return true;
+  const upper = String(symbol || '').toUpperCase();
+  const clean = upper.replace(/\.(SI|TO|V)$/, '').replace(/[.-]UN$/, '').split('.')[0];
+  if (BOND_ETF_TICKERS.has(upper) || BOND_ETF_TICKERS.has(clean)) return true;
   const n = String(name || '').toLowerCase();
   if (
     n.includes(' bond') ||
@@ -75,7 +112,7 @@ function isBondEtf(symbol, name) {
   return false;
 }
 
-// ---------- REIT detection (Issue 2 fix) ----------
+// ---------- REIT detection ----------
 function isReit(symbol, name, sector) {
   if (sector === 'Real Estate') return true;
   const n = String(name || '').toLowerCase();
@@ -143,16 +180,19 @@ const RISK_PROFILES = {
   },
 };
 
+// ✅ CA added. 'All' replaces 'Both' as the mixed-markets option.
+// 'Both' is kept for backward compatibility.
 const LOCATION_MARKETS = {
   SG: ['sg'],
   US: ['us'],
+  CA: ['ca'],
+  All: ['us', 'sg', 'ca'],
   Both: ['us', 'sg'],
 };
 
 const SAFETY_MULT = { Safe: 1.0, Moderate: 0.7, Caution: 0.4 };
 
 // ---------- Candidate cache (30 min TTL) ----------
-// Caches the raw stock fetch so repeated requests don't hammer the DB.
 const candidateCache = new Map();
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
@@ -192,7 +232,6 @@ async function generateAllocation({
   if (!isFinite(targetMonthly) || targetMonthly <= 0) throw new Error('targetMonthly must be positive');
   if (capital < 0) throw new Error('capital cannot be negative');
 
-  // ---------- Load candidates (cached) ----------
   const allStocks = await loadCandidates(markets);
 
   const candidates = [];
@@ -206,28 +245,24 @@ async function generateAllocation({
     const price = parseFloat(s.currentPrice) || 0;
     const sector = getSector(s.symbol, s.name);
 
-    // ✋ Issue 1: hard exclude bond ETFs
     if (isBondEtf(s.symbol, s.name)) continue;
     if (sector === 'Fixed Income') continue;
 
-    // Basic sanity
     if (yieldPct <= 0) continue;
     if (price <= 0) continue;
 
-    // Safety filter
     if (!profile.allowedSafety.includes(safety)) continue;
 
-    // ✋ Issue 2: skip payout ratio filter for REITs
-    // REITs are legally required to distribute 90%+ of income, so EPS-based payout
-    // ratios are meaningless for them. Use different rules.
     const reit = isReit(s.symbol, s.name, sector);
     if (!reit) {
       if (payoutRatio != null && payoutRatio > profile.maxPayoutRatio) continue;
     }
 
-    // Dividend history filters (still apply to everyone)
     if (cagr != null && cagr < -10) continue;
     if (streak < profile.minStreak) continue;
+
+    // ✅ CA: currency fallback now handles CAD
+    const fallbackCcy = s.market === 'sg' ? 'SGD' : s.market === 'ca' ? 'CAD' : 'USD';
 
     candidates.push({
       symbol: s.symbol,
@@ -241,7 +276,7 @@ async function generateAllocation({
       payoutRatio,
       dividendStreak: streak,
       currentPrice: price,
-      currency: data.currency || (s.market === 'sg' ? 'SGD' : 'USD'),
+      currency: data.currency || fallbackCcy,
     });
   }
 
@@ -252,7 +287,6 @@ async function generateAllocation({
     };
   }
 
-  // ---------- Score ----------
   const maxYield = Math.max(...candidates.map(c => c.currentYield), 0.01);
 
   for (const c of candidates) {
@@ -260,7 +294,6 @@ async function generateAllocation({
     const safetyScoreVal = SAFETY_MULT[c.safety] || 0.4;
     const growthScore = Math.min(Math.max(c.dividendCAGR, 0) / 10, 1);
 
-    // REITs get no payout penalty (their ratios are structurally high)
     const payoutPenalty = c.isReit ? 1.0
       : c.payoutRatio == null ? 1.0
         : c.payoutRatio > 100 ? 0.5
@@ -277,7 +310,6 @@ async function generateAllocation({
     return a.symbol.localeCompare(b.symbol);
   });
 
-  // ---------- Select with sector diversification ----------
   const targetN = profile.targetCount;
   const selected = [];
   const sectorCounts = {};
@@ -308,7 +340,6 @@ async function generateAllocation({
     };
   }
 
-  // ---------- Weights ----------
   const totalScore = selected.reduce((s, c) => s + c._score, 0);
   for (const c of selected) c._weight = c._score / totalScore;
 
@@ -339,12 +370,10 @@ async function generateAllocation({
     if (!changed) break;
   }
 
-  // ---------- Required capital ----------
   const weightedYield = selected.reduce((s, c) => s + c.currentYield * c._weight, 0);
   const requiredCapital = weightedYield > 0 ? (targetMonthly * 12) / (weightedYield / 100) : 0;
   const effectiveCapital = capital > 0 ? capital : requiredCapital;
 
-  // ---------- Allocation math ----------
   const positions = [];
   let totalCost = 0;
   let totalMonthlyIncome = 0;
