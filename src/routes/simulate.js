@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { Op } = require('sequelize');
 const Stock = require('../models/stock');
 const { fetchDividendsRaw, fetchPricesRaw, fetchSplitsRaw } = require('../services/yahooFinance');
 const { round2, pct, isoOf } = require('../utils/helpers');
@@ -36,9 +37,9 @@ function findNextPrice(timestamps, closes, targetEpoch) {
 }
 
 // ============ MILLIONAIRE METRICS (reusable) ============
-// ✅ UPDATED: More realistic CAGR caps for long-term projections
-const PRICE_CAGR_CAP = 0.18;    // 18% max — even best stocks rarely sustain higher
-const DIV_CAGR_CAP = 0.12;      // 12% max — aggressive but achievable for best dividend growers
+const PRICE_CAGR_CAP = 0.18;
+const DIV_CAGR_CAP = 0.12;
+const SIM_YIELD_CAP = 0.20;   // Used only for the projection math, not the displayed yield
 
 async function getMillionaireMetrics(symbol, market) {
   let cleanSymbol = String(symbol || '').trim().toUpperCase();
@@ -57,7 +58,6 @@ async function getMillionaireMetrics(symbol, market) {
   }
   if (!currentPrice) throw new Error('Could not determine current price');
 
-  // Compute 5Y price CAGR
   let priceCAGR = 0;
   if (timestamps.length > 0 && closes.length > 0) {
     let earliestPrice = null;
@@ -68,23 +68,20 @@ async function getMillionaireMetrics(symbol, market) {
       const yearsElapsed = (timestamps[timestamps.length - 1] - timestamps[0]) / (365 * 86400);
       if (yearsElapsed >= 1) {
         priceCAGR = Math.pow(currentPrice / earliestPrice, 1 / yearsElapsed) - 1;
-        // ✅ UPDATED: More realistic cap
         priceCAGR = Math.max(-0.10, Math.min(PRICE_CAGR_CAP, priceCAGR));
       }
     }
   }
 
-  // Yield & dividend CAGR
   const { dividends } = await fetchDividendsRaw(cleanSymbol, market);
-  let currentYield = 0;
+  let rawYield = 0;
   let dividendCAGR = 0;
 
   if (dividends.length > 0) {
     const oneYearAgo = nowEpoch - (365 * 86400);
     const recentDivs = dividends.filter(d => d.epoch > oneYearAgo);
     const trailingAnnualDiv = recentDivs.reduce((sum, d) => sum + d.amount, 0);
-    currentYield = currentPrice > 0 ? (trailingAnnualDiv / currentPrice) : 0;
-    currentYield = Math.max(0, Math.min(0.20, currentYield));
+    rawYield = currentPrice > 0 ? (trailingAnnualDiv / currentPrice) : 0;
 
     const byYear = {};
     for (const d of dividends) {
@@ -99,24 +96,38 @@ async function getMillionaireMetrics(symbol, market) {
       const endTotal = byYear[latest];
       if (startTotal > 0 && endTotal > 0 && latest > targetYear) {
         dividendCAGR = Math.pow(endTotal / startTotal, 1 / (latest - targetYear)) - 1;
-        // ✅ UPDATED: More realistic cap (down from 20%)
         dividendCAGR = Math.max(-0.10, Math.min(DIV_CAGR_CAP, dividendCAGR));
       }
     }
   }
 
+  // Capped yield used only for the projection math, so absurd yields don't
+  // produce "reached $1M in 3 months" outputs.
+  const currentYield = Math.max(0, Math.min(SIM_YIELD_CAP, rawYield));
+
+  // Look up the safety score so the frontend can flag risky yields.
+  let safetyScore = 'Caution';
+  try {
+    const dbRow = await Stock.findByPk(cleanSymbol, { attributes: ['safetyScore'] });
+    if (dbRow?.safetyScore) safetyScore = dbRow.safetyScore;
+  } catch (e) { /* ignore — default to Caution */ }
+
   return {
     symbol: cleanSymbol,
     name: meta.longName || meta.shortName || cleanSymbol,
-    currencySymbol: market === 'sg' ? 'S$' : '$',
+    currencySymbol: market === 'sg' ? 'S$' : market === 'ca' ? 'C$' : '$',
     currentPrice: round2(currentPrice),
+    // ✅ rawYield: what the security actually pays right now (shown in the UI)
+    rawYield: Math.round(rawYield * 10000) / 10000,
+    // ✅ currentYield: capped value used by the client-side projection math
     currentYield: Math.round(currentYield * 10000) / 10000,
+    safetyScore,
     priceCAGR: Math.round(priceCAGR * 10000) / 10000,
     dividendCAGR: Math.round(dividendCAGR * 10000) / 10000,
   };
 }
 
-// ============ DCA ROUTE (unchanged) ============
+// ============ DCA ROUTE ============
 router.get('/dca', async (req, res) => {
   let symbol = String(req.query.ticker || '').trim().toUpperCase();
   const market = String(req.query.market || 'us').toLowerCase();
@@ -261,6 +272,23 @@ router.get('/millionaire/:symbol', async (req, res) => {
 const leaderboardCache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
+const LEADERBOARD_MIN_YIELD = 2;
+const LEADERBOARD_MAX_YIELD = 8;
+const LEADERBOARD_MIN_PAYOUTS = 8;
+
+const LEADERBOARD_EXCLUDED = new Set([
+  'TSYY', 'COYY', 'IOYY', 'QBY', 'RGYY', 'YSPY', 'MUYY', 'FIYY', 'CRY',
+  'AMYY', 'XBTY', 'NVYY', 'TQQY', 'MSTY', 'CONY', 'ULTY', 'TSLY', 'NVDY',
+  'YMAX', 'YMAG', 'SLTY', 'CHPY', 'GPTY', 'LFGY', 'XDTE', 'QDTE', 'RDTE',
+  'MAGY', 'AAPW', 'NVW', 'TSLW', 'MSTW', 'PLTW', 'COIW', 'WDTE', 'SPYT',
+  'QQQY', 'IWMY', 'GLDY', 'MST', 'QQQT', 'YBTC', 'BCCC', 'JMMF', 'YBST',
+  'FEPI', 'AIPI', 'CEPI', 'WEEK', 'CRSH', 'DIPS', 'YQQQ', 'WNTR', 'PYPY',
+  'SATA', 'CHAD', 'STRC',
+  'AGNC', 'NLY', 'ORC', 'ARR', 'IVR', 'TWO', 'MFA', 'PMT', 'CIM', 'RITM', 'ABR', 'DX',
+  'PDI', 'PTY', 'PCN', 'PCM', 'RCS', 'UTF', 'ETV', 'ETB', 'ETY', 'BDJ', 'HPI', 'HPF', 'HPS',
+  'PSEC', 'OXLC', 'OCCI', 'GLAD', 'GAIN',
+]);
+
 router.get('/millionaire-leaderboard/:market', async (req, res) => {
   const market = String(req.params.market || 'us').toLowerCase();
   const cacheKey = market;
@@ -273,13 +301,20 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
 
   try {
     const topStocks = await Stock.findAll({
-      where: { market },
+      where: {
+        market,
+        currentYield: { [Op.between]: [LEADERBOARD_MIN_YIELD, LEADERBOARD_MAX_YIELD] },
+        safetyScore: { [Op.in]: ['Safe', 'Moderate'] },
+        payoutCount: { [Op.gte]: LEADERBOARD_MIN_PAYOUTS },
+        symbol: { [Op.notIn]: [...LEADERBOARD_EXCLUDED] },
+      },
       order: [['currentYield', 'DESC']],
       limit: 15,
       attributes: ['symbol', 'name'],
     });
 
     if (topStocks.length === 0) {
+      console.warn(`⚠️  Leaderboard for ${market} returned 0 stocks after quality filter`);
       return res.json({ stocks: [], market });
     }
 
@@ -295,7 +330,7 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
 
     leaderboardCache.set(cacheKey, { timestamp: Date.now(), data: payload });
 
-    console.log(`✅ Leaderboard generated for ${market}: ${stocks.length} stocks`);
+    console.log(`✅ Leaderboard generated for ${market}: ${stocks.length} quality stocks`);
     res.json(payload);
   } catch (e) {
     console.error('Leaderboard error:', e);
