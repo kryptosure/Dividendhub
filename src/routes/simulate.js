@@ -4,6 +4,7 @@ const { Op } = require('sequelize');
 const Stock = require('../models/stock');
 const { fetchDividendsRaw, fetchPricesRaw, fetchSplitsRaw } = require('../services/yahooFinance');
 const { round2, pct, isoOf } = require('../utils/helpers');
+const { classifyAssetType } = require('../services/stockClassifier');
 
 // ============ HELPERS ============
 function getFirstTradingDay(timestamps, year, month) {
@@ -101,25 +102,20 @@ async function getMillionaireMetrics(symbol, market) {
     }
   }
 
-  // Capped yield used only for the projection math, so absurd yields don't
-  // produce "reached $1M in 3 months" outputs.
   const currentYield = Math.max(0, Math.min(SIM_YIELD_CAP, rawYield));
 
-  // Look up the safety score so the frontend can flag risky yields.
   let safetyScore = 'Caution';
   try {
     const dbRow = await Stock.findByPk(cleanSymbol, { attributes: ['safetyScore'] });
     if (dbRow?.safetyScore) safetyScore = dbRow.safetyScore;
-  } catch (e) { /* ignore — default to Caution */ }
+  } catch (e) { /* default to Caution */ }
 
   return {
     symbol: cleanSymbol,
     name: meta.longName || meta.shortName || cleanSymbol,
     currencySymbol: market === 'sg' ? 'S$' : market === 'ca' ? 'C$' : '$',
     currentPrice: round2(currentPrice),
-    // ✅ rawYield: what the security actually pays right now (shown in the UI)
     rawYield: Math.round(rawYield * 10000) / 10000,
-    // ✅ currentYield: capped value used by the client-side projection math
     currentYield: Math.round(currentYield * 10000) / 10000,
     safetyScore,
     priceCAGR: Math.round(priceCAGR * 10000) / 10000,
@@ -275,19 +271,48 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const LEADERBOARD_MIN_YIELD = 2;
 const LEADERBOARD_MAX_YIELD = 8;
 const LEADERBOARD_MIN_PAYOUTS = 8;
+const LEADERBOARD_CANDIDATE_POOL = 50;
+const LEADERBOARD_RETURN_COUNT = 15;
+
+// Asset classes that don't compound. A "dividend compounder" must be an
+// operating business whose dividend grows — not a fixed-income instrument.
+const NON_COMPOUNDING_ASSET_TYPES = new Set(['Bond ETF', 'Preferred Stock']);
 
 const LEADERBOARD_EXCLUDED = new Set([
+  // Options-income ETFs — return of capital, NAV erosion
   'TSYY', 'COYY', 'IOYY', 'QBY', 'RGYY', 'YSPY', 'MUYY', 'FIYY', 'CRY',
   'AMYY', 'XBTY', 'NVYY', 'TQQY', 'MSTY', 'CONY', 'ULTY', 'TSLY', 'NVDY',
   'YMAX', 'YMAG', 'SLTY', 'CHPY', 'GPTY', 'LFGY', 'XDTE', 'QDTE', 'RDTE',
   'MAGY', 'AAPW', 'NVW', 'TSLW', 'MSTW', 'PLTW', 'COIW', 'WDTE', 'SPYT',
   'QQQY', 'IWMY', 'GLDY', 'MST', 'QQQT', 'YBTC', 'BCCC', 'JMMF', 'YBST',
   'FEPI', 'AIPI', 'CEPI', 'WEEK', 'CRSH', 'DIPS', 'YQQQ', 'WNTR', 'PYPY',
+  // Daily preferred (crypto-backed)
   'SATA', 'CHAD', 'STRC',
+  // Mortgage REITs — book value erosion in rate cycles
   'AGNC', 'NLY', 'ORC', 'ARR', 'IVR', 'TWO', 'MFA', 'PMT', 'CIM', 'RITM', 'ABR', 'DX',
+  // Speculative CEFs — ROC-heavy distributions
   'PDI', 'PTY', 'PCN', 'PCM', 'RCS', 'UTF', 'ETV', 'ETB', 'ETY', 'BDJ', 'HPI', 'HPF', 'HPS',
+  // High-risk BDCs
   'PSEC', 'OXLC', 'OCCI', 'GLAD', 'GAIN',
+  // Bond ETFs
+  'SJNK', 'SRLN', 'JNK', 'HYG', 'LQD', 'AGG', 'BND', 'TLT', 'IEF', 'SHY',
+  'GOVT', 'SCHZ', 'SGOV', 'BIL', 'SPTL', 'SPTI', 'SPTS', 'SPIB', 'VGSH',
+  'VGIT', 'VGLT', 'VCSH', 'VCIT', 'VCLT', 'USIG', 'IGIB', 'SHYG', 'HYLB',
+  'ANGL', 'FALN', 'MUB', 'VTEB', 'TFI', 'BNDX', 'EMB', 'IEMB', 'IGOV',
+  'BWX', 'VTIP', 'TIP', 'STIP', 'FLOT', 'FLRN', 'NEAR', 'JPST', 'MINT',
+  // CEFs that have appeared
+  'BME', 'BOE', 'BUI', 'EOI', 'EOS', 'ETG', 'ETJ', 'ETO', 'ETB', 'ETY',
 ]);
+
+// Compounder score: what actually matters over a 40-year horizon.
+// Weight dividend growth 2x because it compounds, while yield is a
+// snapshot of today.
+function compounderScore(metrics) {
+  const yieldPct = metrics.rawYield * 100;
+  const divCagrPct = metrics.dividendCAGR * 100;
+  const priceCagrPct = metrics.priceCAGR * 100;
+  return yieldPct + (divCagrPct * 2) + (priceCagrPct * 0.5);
+}
 
 router.get('/millionaire-leaderboard/:market', async (req, res) => {
   const market = String(req.params.market || 'us').toLowerCase();
@@ -300,7 +325,8 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
   }
 
   try {
-    const topStocks = await Stock.findAll({
+    // ---- Step 1: fetch a generous candidate pool ----
+    const candidates = await Stock.findAll({
       where: {
         market,
         currentYield: { [Op.between]: [LEADERBOARD_MIN_YIELD, LEADERBOARD_MAX_YIELD] },
@@ -309,28 +335,48 @@ router.get('/millionaire-leaderboard/:market', async (req, res) => {
         symbol: { [Op.notIn]: [...LEADERBOARD_EXCLUDED] },
       },
       order: [['currentYield', 'DESC']],
-      limit: 15,
-      attributes: ['symbol', 'name'],
+      limit: LEADERBOARD_CANDIDATE_POOL,
+      attributes: ['symbol', 'name', 'type'],
     });
 
-    if (topStocks.length === 0) {
-      console.warn(`⚠️  Leaderboard for ${market} returned 0 stocks after quality filter`);
+    if (candidates.length === 0) {
+      console.warn(`⚠️  Leaderboard for ${market} returned 0 candidates`);
       return res.json({ stocks: [], market });
     }
 
+    // ---- Step 2: compute metrics for each candidate ----
     const results = await Promise.allSettled(
-      topStocks.map(s => getMillionaireMetrics(s.symbol, market))
+      candidates.map(s => getMillionaireMetrics(s.symbol, market))
     );
 
-    const stocks = results
+    let enriched = results
       .filter(r => r.status === 'fulfilled' && r.value && r.value.currentPrice > 0)
       .map(r => r.value);
+
+    // ---- Step 3: filter by asset class (drop bond ETFs / preferreds) ----
+    enriched = enriched.filter(m => {
+      const assetType = classifyAssetType(m.symbol, m.name);
+      return !NON_COMPOUNDING_ASSET_TYPES.has(assetType);
+    });
+
+    // ---- Step 4: filter by growth quality ----
+    enriched = enriched.filter(m => {
+      const divCagrPct = m.dividendCAGR * 100;
+      const priceCagrPct = m.priceCAGR * 100;
+      if (divCagrPct < -1) return false;    // dividend must not be shrinking
+      if (priceCagrPct < -5) return false;  // price must not be collapsing
+      return true;
+    });
+
+    // ---- Step 5: rank by compounder score, take top N ----
+    enriched.sort((a, b) => compounderScore(b) - compounderScore(a));
+    const stocks = enriched.slice(0, LEADERBOARD_RETURN_COUNT);
 
     const payload = { stocks, market, generatedAt: new Date().toISOString() };
 
     leaderboardCache.set(cacheKey, { timestamp: Date.now(), data: payload });
 
-    console.log(`✅ Leaderboard generated for ${market}: ${stocks.length} quality stocks`);
+    console.log(`✅ Leaderboard generated for ${market}: ${stocks.length} compounders (from ${candidates.length} candidates)`);
     res.json(payload);
   } catch (e) {
     console.error('Leaderboard error:', e);
