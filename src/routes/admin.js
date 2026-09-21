@@ -1,10 +1,15 @@
 const express = require('express');
 const Stock = require('../models/stock');
-const yahooFinanceLib = require('yahoo-finance2');
-const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
+const YahooFinance = require('yahoo-finance2').default;
 const { refreshTopStocks } = require('../services/stockService');
 
 const router = express.Router();
+
+// ✅ v3: instantiate the class once at module load.
+// suppressNotices silences the "v2 unmaintained" nag on every call.
+const yahooFinance = new YahooFinance({
+  suppressNotices: ['yahooSurvey'],
+});
 
 // ---------- Legacy: small curated refresh ----------
 router.post('/refresh', async (req, res) => {
@@ -69,7 +74,7 @@ router.post('/seed-universe', async (req, res) => {
       console.log(`🌱 Seed starting: market=${market}`);
       const { getSeedList } = require('../services/stockUniverse');
       const lists = getSeedList();
-      console.log(`📋 Seed list loaded: US=${lists.us.length}, SG=${lists.sg.length}`);
+      console.log(`📋 Seed list loaded: US=${lists.us.length}, SG=${lists.sg.length}, CA=${lists.ca?.length || 0}`);
 
       const result = await refreshTopStocks(market === 'all' ? null : market);
       lastSeedResult = { ...result, startedAt, finishedAt: new Date().toISOString() };

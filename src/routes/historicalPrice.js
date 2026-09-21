@@ -1,8 +1,14 @@
 const express = require('express');
 const axios = require('axios');
-const yahooFinance = require('yahoo-finance2');
+const YahooFinance = require('yahoo-finance2').default;
 
 const router = express.Router();
+
+// ✅ v3: instantiate the class once
+const yahooFinance = new YahooFinance({
+  suppressNotices: ['yahooSurvey'],
+});
+
 const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 const POLYGON_BASE_URL = 'https://api.polygon.io';
 
@@ -25,8 +31,8 @@ router.get('/:symbol', async (req, res) => {
             adjusted: true,
             sort: 'asc',
             limit: 5000,
-            apiKey: POLYGON_API_KEY
-          }
+            apiKey: POLYGON_API_KEY,
+          },
         });
 
         if (response.data.results) {
@@ -36,15 +42,15 @@ router.get('/:symbol', async (req, res) => {
             high: item.h,
             low: item.l,
             close: item.c,
-            volume: item.v
+            volume: item.v,
           }));
 
           return res.json({
-            symbol: symbol,
+            symbol,
             from: fromDate,
             to: toDate,
-            timeframe: timeframe,
-            data: transformedData
+            timeframe,
+            data: transformedData,
           });
         }
       } catch (e) {
@@ -52,35 +58,43 @@ router.get('/:symbol', async (req, res) => {
       }
     }
 
-    // Fallback to Yahoo Finance
-    const queryOptions = {
-      period1: fromDate || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000),
-      period2: toDate || new Date(),
+    // ✅ v3: `historical()` was removed. Use `chart()` instead.
+    // Convert YYYY-MM-DD to Unix seconds.
+    const period1 = Math.floor(new Date(fromDate + 'T00:00:00Z').getTime() / 1000);
+    const period2 = Math.floor(new Date(toDate + 'T23:59:59Z').getTime() / 1000);
+
+    const result = await yahooFinance.chart(symbol, {
+      period1,
+      period2,
       interval: '1d',
-    };
-    
-    const result = await yahooFinance.historical(symbol, queryOptions);
-    
+    });
+
+    if (!result || !result.quotes || result.quotes.length === 0) {
+      return res.status(404).json({ error: 'No historical data found for symbol' });
+    }
+
     res.json({
-      symbol: symbol,
+      symbol,
       from: fromDate,
       to: toDate,
-      timeframe: timeframe,
-      data: result.map(item => ({
-        date: item.date.toISOString().split('T')[0],
-        open: item.open,
-        high: item.high,
-        low: item.low,
-        close: item.close,
-        volume: item.volume
-      }))
+      timeframe,
+      data: result.quotes
+        .filter(q => q.close != null)   // drop empty rows
+        .map(item => ({
+          date: new Date(item.date).toISOString().split('T')[0],
+          open: item.open,
+          high: item.high,
+          low: item.low,
+          close: item.close,
+          volume: item.volume,
+        })),
     });
 
   } catch (error) {
     console.error('Error fetching historical data:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to fetch historical data',
-      details: error.message 
+      details: error.message,
     });
   }
 });

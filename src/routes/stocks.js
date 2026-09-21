@@ -66,7 +66,7 @@ const FALLBACK_MAP = {
     'es3': [{ symbol: 'ES3.SI', name: 'SPDR Straits Times Index ETF', exchange: 'SGX' }],
     'g3b': [{ symbol: 'G3B.SI', name: 'Nikko AM Singapore STI ETF', exchange: 'SGX' }],
   },
-  // ✅ NEW: Canada fallback — used only when both Yahoo and DB search return nothing.
+  // ✅ CA: Canada fallback — used only when both Yahoo and DB search return nothing.
   ca: {
     'royal bank': [{ symbol: 'RY.TO', name: 'Royal Bank of Canada', exchange: 'TSX' }],
     'rbc': [{ symbol: 'RY.TO', name: 'Royal Bank of Canada', exchange: 'TSX' }],
@@ -467,6 +467,138 @@ router.get('/long-term-growth', limiter, async (req, res) => {
 
   console.error(`long-term-growth failed for ${symbol}:`, lastError?.message);
   return res.status(500).json({ error: 'Failed to fetch long-term growth data' });
+});
+
+// ================================================================
+// UPCOMING EX-DIVIDEND CALENDAR
+// Estimates future ex-dates from each stock's historical payout pattern.
+// ⚠️  MUST be defined BEFORE the /:symbol catch-all route.
+// ================================================================
+const upcomingCache = new Map();
+const UPCOMING_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+function computeUpcomingExDates(byYear, maxDays = 60) {
+  if (!Array.isArray(byYear) || byYear.length === 0) return [];
+
+  const allPayouts = [];
+  for (const y of byYear) {
+    if (Array.isArray(y.payouts)) {
+      for (const p of y.payouts) {
+        allPayouts.push({ date: p.date, amount: p.amount });
+      }
+    }
+  }
+  if (allPayouts.length < 4) return [];
+
+  allPayouts.sort((a, b) => a.date.localeCompare(b.date));
+  const recent = allPayouts.slice(-8);
+
+  const gaps = [];
+  for (let i = 1; i < recent.length; i++) {
+    const d1 = new Date(recent[i - 1].date + 'T00:00:00Z').getTime();
+    const d2 = new Date(recent[i].date + 'T00:00:00Z').getTime();
+    const days = (d2 - d1) / 86400000;
+    if (days > 5 && days < 400) gaps.push(days);
+  }
+  if (gaps.length === 0) return [];
+  gaps.sort((a, b) => a - b);
+  const medianGap = gaps[Math.floor(gaps.length / 2)];
+
+  const lastDate = new Date(recent[recent.length - 1].date + 'T00:00:00Z');
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const maxDate = new Date(today.getTime() + maxDays * 86400000);
+
+  let cursor = new Date(lastDate);
+  while (cursor < today) {
+    cursor = new Date(cursor.getTime() + medianGap * 86400000);
+  }
+
+  const upcoming = [];
+  while (cursor <= maxDate && upcoming.length < 4) {
+    upcoming.push({
+      date: cursor.toISOString().slice(0, 10),
+      daysFromNow: Math.round((cursor - today) / 86400000),
+    });
+    cursor = new Date(cursor.getTime() + medianGap * 86400000);
+  }
+  return upcoming;
+}
+
+router.get('/upcoming-dividends', limiter, async (req, res) => {
+  try {
+    const market = String(req.query.market || 'us').toLowerCase();
+    const days = Math.min(Math.max(parseInt(req.query.days) || 60, 7), 120);
+
+    const cacheKey = `${market}:${days}`;
+    const cached = upcomingCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < UPCOMING_CACHE_TTL_MS) {
+      return res.json(cached.data);
+    }
+
+    const markets = market === 'both' ? ['us', 'sg', 'ca'] : [market];
+    const stocks = await Stock.findAll({ where: { market: markets } });
+
+    const events = [];
+    for (const s of stocks) {
+      const data = s.dividendData || {};
+      const freq = computeFrequency(data.byYear);
+      if (!freq || freq.label === 'Unknown') continue;
+
+      const upcoming = computeUpcomingExDates(data.byYear, days);
+      if (upcoming.length === 0) continue;
+
+      const trailingDiv = Number(data.trailingAnnualDiv) || 0;
+      const ppy = freq.paymentsPerYear || 1;
+      const estimatedAmount = ppy > 0
+        ? Math.round((trailingDiv / ppy) * 100) / 100
+        : 0;
+
+      const currentPrice = parseFloat(s.currentPrice) || 0;
+      const currentYield = parseFloat(s.currentYield) || 0;
+      const assetType = classifyAssetType(s.symbol, s.name, s.type);
+
+      for (const u of upcoming) {
+        events.push({
+          symbol: s.symbol,
+          name: s.name || s.symbol,
+          market: s.market,
+          assetType,
+          frequency: freq.label,
+          exDate: u.date,
+          daysFromNow: u.daysFromNow,
+          estimatedAmount,
+          currentPrice,
+          currentYield,
+          safetyScore: s.safetyScore || 'Caution',
+        });
+      }
+    }
+
+    events.sort((a, b) => a.exDate.localeCompare(b.exDate));
+
+    const payload = {
+      events,
+      market,
+      days,
+      totalCount: events.length,
+      uniqueStocks: new Set(events.map((e) => e.symbol)).size,
+      generatedAt: new Date().toISOString(),
+    };
+
+    upcomingCache.set(cacheKey, { data: payload, timestamp: Date.now() });
+    if (upcomingCache.size > 50) {
+      const cutoff = Date.now() - UPCOMING_CACHE_TTL_MS;
+      for (const [k, v] of upcomingCache.entries()) {
+        if (v.timestamp < cutoff) upcomingCache.delete(k);
+      }
+    }
+
+    res.json(payload);
+  } catch (e) {
+    console.error('Upcoming dividends error:', e);
+    res.status(500).json({ error: 'Failed to compute upcoming dividends' });
+  }
 });
 
 // ---------- Get single stock ----------

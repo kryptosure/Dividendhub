@@ -21,6 +21,6 @@
     "pg": "^8.23.0",
     "pg-hstore": "^2.3.4",
     "sequelize": "^6.37.8",
-    "yahoo-finance2": "^2.14.2"
+    "yahoo-finance2": "^4.0.2"
   }
 }

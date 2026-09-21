@@ -12,9 +12,13 @@
  * Returns a percentage (e.g. 45.2) or null.
  */
 
-const yahooFinanceLib = require('yahoo-finance2');
-const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
+const YahooFinance = require('yahoo-finance2').default;
 const axios = require('axios');
+
+// ✅ v3: instantiate the class once at module load
+const yahooFinance = new YahooFinance({
+  suppressNotices: ['yahooSurvey'],
+});
 
 const FMP_API_KEY = process.env.FMP_API_KEY;
 const FMP_BASE_URL = 'https://financialmodelingprep.com/stable';

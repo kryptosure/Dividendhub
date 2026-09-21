@@ -1,6 +1,11 @@
 const { fetchJson, sleep, currencySymbol, round2, pct, isoOf } = require('../utils/helpers');
-const yahooFinanceLib = require('yahoo-finance2');
-const yahooFinance = yahooFinanceLib.default || yahooFinanceLib;
+const YahooFinance = require('yahoo-finance2').default;
+
+// ✅ v3: yahoo-finance2 exports a class now — instantiate once at module load.
+// suppressNotices silences the "v2 is unmaintained" nag on every call.
+const yahooFinance = new YahooFinance({
+  suppressNotices: ['yahooSurvey'],
+});
 
 const UA = process.env.YAHOO_FINANCE_UA || 'Mozilla/5.0 (compatible; DividendHub/2.0)';
 
@@ -68,8 +73,9 @@ async function fetchPricesRaw(symbol, startEpoch) {
 
 async function fetchEPSRaw(symbol) {
   try {
+    // ✅ v3: works identically — uses the instance instantiated at top of file
     const result = await yahooFinance.quoteSummary(symbol, {
-      modules: ['defaultKeyStatistics', 'financialData']
+      modules: ['defaultKeyStatistics', 'financialData'],
     });
     const stats = result.defaultKeyStatistics || {};
     const fin = result.financialData || {};
@@ -89,7 +95,7 @@ async function fetchSplitsRaw(symbol) {
   const ev = chart.result[0].events?.splits || {};
   const splits = Object.values(ev).map(s => ({
     epoch: s.date,
-    ratio: (Number(s.numerator) || 1) / (Number(s.denominator) || 1)
+    ratio: (Number(s.numerator) || 1) / (Number(s.denominator) || 1),
   })).filter(s => isFinite(s.ratio) && s.ratio > 0);
   splits.sort((a, b) => a.epoch - b.epoch);
   return splits;
@@ -130,13 +136,12 @@ async function yahooSearch(q, market) {
     shortname: x.shortname || x.symbol,
     longname: x.longname || x.shortname || '',
     // ✅ FIX (CA): market-aware exchange fallback
-    exchange: x.exchange || defaultExchangeFor(market)
+    exchange: x.exchange || defaultExchangeFor(market),
   }));
 }
 
 // ================================================================
 // ✅ Compute dividend metrics from a byYear array.
-// (unchanged — kept as-is for completeness)
 // ================================================================
 function computeDividendMetrics(byYear) {
   const empty = { dividendCAGR: null, dividendFrequency: null, dividendStreak: 0, completeYears: [] };
@@ -288,7 +293,7 @@ async function fetchDividendData(symbol, market) {
       }
     } catch (e) { /* skip */ }
 
-    // ---------- Safety score (unchanged) ----------
+    // ---------- Safety score ----------
     let safetyScore = 'Caution';
     let payoutRatio = null;
     try {
