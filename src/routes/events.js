@@ -51,12 +51,15 @@ const ALLOWED_EVENTS = new Set([
   'export_pdf',
   'share_whatsapp',
 
-  // ✅ NEW: Income Planner
+  // Income Planner
   'income_planner_generate',
   'income_planner_save_portfolio',
 
-  // ✅ NEW: Screener
+  // Screener
   'screener_filter',
+
+  // ✅ NEW: Article feedback (thumbs up/down)
+  'article_feedback',
 ]);
 
 router.post('/', async (req, res) => {
