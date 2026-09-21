@@ -41,6 +41,9 @@ app.use('/api/events', require('./routes/events'));
 // ✅ NEW: Income Planner routes
 app.use('/api/income-planner', require('./routes/incomePlanner'));
 
+// ✅ NEW: AI subsite streaming chat (ai.dividendbro.com)
+app.use('/api/ai', require('./routes/ai'));
+
 // ---------- /api/search endpoint ----------
 const FALLBACK_MAP = {
   us: {
