@@ -26,6 +26,35 @@ const MODELS = [
   'openai/gpt-oss-20b',    // Fallback: faster, lighter
 ];
 
+// ---------- Sector → ticker map for category-based questions ----------
+// The AI cannot enumerate "all banks" from text search. This maps common
+// categories to curated ticker lists per market.
+const SECTOR_MAP = {
+  ca: {
+    banks:     ['RY.TO', 'TD.TO', 'BNS.TO', 'BMO.TO', 'CM.TO', 'NA.TO'],
+    energy:    ['ENB.TO', 'TRP.TO', 'PPL.TO', 'SU.TO', 'CNQ.TO', 'FRU.TO'],
+    utilities: ['FTS.TO', 'CU.TO'],
+    telecom:   ['BCE.TO', 'T.TO'],
+    reits:     ['SRU-UN.TO', 'REI-UN.TO', 'GRT-UN.TO', 'CRT-UN.TO', 'CRR-UN.TO', 'DIR-UN.TO', 'VITL-UN.TO', 'CHP-UN.TO'],
+  },
+  us: {
+    banks:     ['JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'USB', 'PNC', 'TFC', 'COF'],
+    energy:    ['XOM', 'CVX', 'COP', 'EOG', 'PSX', 'VLO', 'MPC', 'KMI', 'WMB', 'OKE'],
+    utilities: ['NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'XEL', 'ED', 'WEC', 'ES'],
+    telecom:   ['VZ', 'T', 'TMUS', 'CMCSA'],
+    reits:     ['O', 'STAG', 'LAND', 'LTC', 'ADC', 'EPR', 'GOOD', 'DOC', 'VICI', 'WPC', 'NNN', 'IRM', 'GLPI'],
+    tobacco:   ['MO', 'PM'],
+    staples:   ['KO', 'PEP', 'PG', 'KHC', 'GIS', 'KMB', 'CL', 'CLX', 'K', 'HSY', 'MDLZ'],
+    healthcare:['JNJ', 'PFE', 'MRK', 'ABBV', 'LLY', 'BMY', 'AMGN', 'GILD', 'MDT', 'ABT'],
+    tech:      ['AAPL', 'MSFT', 'IBM', 'INTC', 'CSCO', 'TXN', 'AVGO', 'QCOM', 'ORCL'],
+  },
+  sg: {
+    banks:     ['D05.SI', 'O39.SI', 'U11.SI'],
+    telecom:   ['Z74.SI'],
+    reits:     ['C38U.SI', 'A17U.SI', 'M44U.SI', 'ME8U.SI', 'N2IU.SI', 'J69U.SI', 'BUOU.SI', 'AJBU.SI', 'K71U.SI', 'T82U.SI'],
+  },
+};
+
 // ---------- System prompt ----------
 const BASE_SYSTEM_PROMPT = `You are DividendBro AI — the assistant for dividendbro.com, a dividend analysis tool covering 672 dividend-paying stocks across US, Canadian (TSX), and Singapore (SGX) markets.
 
@@ -47,14 +76,18 @@ You help users understand dividend investing AND query DividendBro's live data. 
 6. Never invent specific metrics, dates, or numbers. Always use tools.
 
 ## Tools Available
-You have tools that query DividendBro's live database. USE THEM whenever the user asks about specific stocks, current yields, upcoming dividend dates, or wants to filter stocks.
+You have tools that query DividendBro's live database. USE THEM whenever the user asks about specific stocks, current yields, upcoming dividend dates, categories of stocks, or wants to filter stocks.
 
 Examples that REQUIRE tool calls:
 - "What's Enbridge's yield?" → get_stock_details(symbol='ENB.TO', market='ca')
 - "Show me top monthly dividend stocks" → screen_stocks(market='us', frequency='monthly')
 - "What's paying dividends next week?" → get_upcoming_dividends(market='us', days=7)
 - "Is Coca-Cola safe?" → get_stock_details(symbol='KO', market='us')
-- "Compare Canadian banks" → search_stocks(query='Royal Bank', market='ca') then get_stock_details for each
+- "Compare Canadian banks vs US banks" → get_stocks_by_sector(sector='banks', market='ca') AND get_stocks_by_sector(sector='banks', market='us')
+- "Show me energy stocks" → get_stocks_by_sector(sector='energy', market='us')
+- "List Canadian REITs" → get_stocks_by_sector(sector='reits', market='ca')
+
+If you need data about a CATEGORY of stocks (banks, energy, utilities, telecom, REITs, tobacco, staples, healthcare, tech) rather than a specific ticker, use get_stocks_by_sector. NEVER try to search for a category with search_stocks — that tool only works on specific ticker symbols or company names.
 
 NEVER invent specific numbers. If you don't have them, call a tool.
 
@@ -65,7 +98,7 @@ Tool results use explicit unit suffixes. Read them carefully:
 - \`dividendStreakYears\` — YEARS, not quarters or months. 31 means 31 YEARS.
 - \`paymentsPerYear\` — payments per year. 4 = quarterly, 12 = monthly, 1 = annual.
 
-When describing values, always use the correct unit. Say "31 years" NOT "31 quarters". Say "5.65%" NOT "5.65".
+When describing values, always use the correct unit. Say "31 years" NOT "31 quarters".
 
 ## Links (IMPORTANT)
 When you mention a specific stock, ALWAYS include a markdown link to its DividendBro detail page using the "url" field from the tool result:
@@ -82,7 +115,26 @@ Include 1-3 relevant links in most answers. Make them feel natural, not spammy.
 
 ## Format
 - Use markdown: **bold**, bullet points, tables.
-- Long answers should have ## section headers.`;
+- Long answers should have ## section headers.
+
+## Follow-Up Suggestions (REQUIRED)
+After EVERY answer, you MUST append exactly 3 follow-up questions the user might naturally ask next.
+
+Format them EXACTLY like this, on a new line after your answer:
+
+---SUGGESTIONS---
+Question one?
+Question two?
+Question three?
+
+Rules for suggestions:
+- Each must be a single question ending in "?"
+- Keep each under 60 characters
+- They must be natural follow-ups to the current answer, not repeats
+- They must be answerable by you (educational, not asking for recommendations)
+- Do NOT add bullets, numbers, or prefixes — just the raw question text
+- Do NOT include the disclaimer in the suggestions block
+- Do NOT wrap the delimiter in backticks or add other text before it`;
 
 // ---------- Tool definitions ----------
 const TOOLS = [
@@ -90,7 +142,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'search_stocks',
-      description: 'Search DividendBro for dividend-paying stocks by ticker or company name. Returns up to 10 matches with symbol, name, current yield, and price.',
+      description: 'Search DividendBro for dividend-paying stocks by ticker or company name. Returns up to 10 matches with symbol, name, current yield, and price. Does NOT work for categories like "banks" — use get_stocks_by_sector for those.',
       parameters: {
         type: 'object',
         properties: {
@@ -161,6 +213,26 @@ const TOOLS = [
           limit: { type: 'integer', description: 'Max results (default 15, max 30)' },
         },
         required: ['market'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_stocks_by_sector',
+      description: 'Get all DividendBro stocks in a specific sector/category for a market. USE THIS for "compare Canadian banks vs US banks", "show me energy stocks", "list REITs", or any question about a category of stocks rather than a specific ticker.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sector: {
+            type: 'string',
+            enum: ['banks', 'energy', 'utilities', 'telecom', 'reits', 'tobacco', 'staples', 'healthcare', 'tech'],
+            description: 'Sector/category to fetch',
+          },
+          market: { type: 'string', enum: ['us', 'ca', 'sg'] },
+          limit: { type: 'integer', description: 'Max stocks to return (default 10, max 20)' },
+        },
+        required: ['sector', 'market'],
       },
     },
   },
@@ -357,6 +429,38 @@ async function executeTool(name, args) {
         };
       }
 
+      case 'get_stocks_by_sector': {
+        const sector = String(args?.sector || '').toLowerCase().trim();
+        const limit = Math.min(Math.max(parseInt(args?.limit) || 10, 1), 20);
+        const tickers = SECTOR_MAP[safeMarket]?.[sector];
+        if (!tickers || tickers.length === 0) {
+          return {
+            error: `No stocks in category "${sector}" for market "${safeMarket}". Available: ${Object.keys(SECTOR_MAP[safeMarket] || {}).join(', ')}`,
+          };
+        }
+        const rows = await Stock.findAll({
+          where: { symbol: { [Op.in]: tickers.slice(0, limit) } },
+          attributes: ['symbol', 'name', 'currentYield', 'currentPrice', 'safetyScore'],
+          raw: true,
+        });
+        const bySymbol = {};
+        for (const r of rows) bySymbol[r.symbol] = r;
+        const ordered = tickers.map(s => bySymbol[s]).filter(Boolean);
+        return {
+          market: safeMarket,
+          sector,
+          count: ordered.length,
+          results: ordered.map(s => ({
+            symbol: s.symbol,
+            name: s.name,
+            yieldPercent: parseFloat(s.currentYield) || 0,
+            price: parseFloat(s.currentPrice) || 0,
+            safety: s.safetyScore,
+            url: `https://dividendbro.com/search?symbol=${encodeURIComponent(s.symbol)}`,
+          })),
+        };
+      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -386,7 +490,7 @@ function checkRateLimit(key) {
 // ---------- Multi-turn streaming with tool calling ----------
 async function* processChat(initialMessages, apiKey) {
   let currentMessages = [...initialMessages];
-  const MAX_ROUNDS = 3;
+  const MAX_ROUNDS = 5;
 
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     console.log(`🤖 [ai] Round ${round}`);
