@@ -27,8 +27,6 @@ const MODELS = [
 ];
 
 // ---------- Sector → ticker map for category-based questions ----------
-// The AI cannot enumerate "all banks" from text search. This maps common
-// categories to curated ticker lists per market.
 const SECTOR_MAP = {
   ca: {
     banks:     ['RY.TO', 'TD.TO', 'BNS.TO', 'BMO.TO', 'CM.TO', 'NA.TO'],
@@ -495,43 +493,77 @@ async function* processChat(initialMessages, apiKey) {
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     console.log(`🤖 [ai] Round ${round}`);
 
+    // ✅ Try each model. On 429, wait briefly and retry the SAME model once
+    // before moving on — Groq's per-minute rate windows are often <1s.
     let upstream = null;
     let lastErr = null;
-    for (const model of MODELS) {
-      try {
-        const res = await fetch(GROQ_URL, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model,
-            messages: currentMessages,
-            tools: TOOLS,
-            tool_choice: 'auto',
-            max_tokens: 2000,
-            temperature: 0.6,
-            stream: true,
-          }),
-        });
+    let allRateLimited = true;
+    let sawNonRateLimitError = false;
 
-        if (res.ok && res.body) {
-          console.log(`✅ [ai] Using model: ${model}`);
-          upstream = res;
+    for (const model of MODELS) {
+      let res = null;
+      let attemptErr = null;
+
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          res = await fetch(GROQ_URL, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model,
+              messages: currentMessages,
+              tools: TOOLS,
+              tool_choice: 'auto',
+              max_tokens: 2000,
+              temperature: 0.6,
+              stream: true,
+            }),
+          });
+
+          if (res.ok && res.body) {
+            console.log(`✅ [ai] Using model: ${model} (attempt ${attempt})`);
+            upstream = res;
+            break;
+          }
+
+          const text = await res.text().catch(() => '');
+          attemptErr = `HTTP ${res.status}: ${text.slice(0, 150)}`;
+
+          // If it's a 429, wait and retry the same model once
+          if (res.status === 429 && attempt === 1) {
+            console.warn(`⏳ [ai] ${model} rate-limited — retrying in 1200ms`);
+            await new Promise((r) => setTimeout(r, 1200));
+            continue;
+          }
+
+          // Not a 429 or already retried — move to next model
+          break;
+        } catch (e) {
+          attemptErr = e.message;
           break;
         }
+      }
 
-        const text = await res.text().catch(() => '');
-        lastErr = `${model} → HTTP ${res.status}: ${text.slice(0, 150)}`;
-        console.warn(`❌ [ai] ${lastErr}`);
-      } catch (e) {
-        lastErr = `${model} → ${e.message}`;
-        console.warn(`❌ [ai] ${lastErr}`);
+      if (upstream) break;
+
+      lastErr = `${model} → ${attemptErr}`;
+      console.warn(`❌ [ai] ${lastErr}`);
+
+      // Track whether this was a rate-limit vs other error
+      if (!attemptErr || !attemptErr.includes('429')) {
+        allRateLimited = false;
+        sawNonRateLimitError = true;
       }
     }
 
     if (!upstream || !upstream.body) {
+      // If every failure was a 429, send back a friendly rate-limit message
+      if (allRateLimited && !sawNonRateLimitError) {
+        throw new Error('AI is briefly overloaded. Please wait 20-30 seconds and try again.');
+      }
       throw new Error(lastErr || 'All Groq models failed');
     }
 
