@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
 const path = require('path');
+const passport = require('passport');              // ✅ NEW
 const sequelize = require('./config/database');
 require('./jobs/refreshStocks');
 
@@ -10,6 +11,10 @@ require('./jobs/refreshStocks');
 const Stock = require('./models/stock');
 const { Op } = require('sequelize');
 const { yahooSearch } = require('./services/yahooFinance');
+
+// ✅ NEW: Registering the Google strategy as a side effect of requiring auth routes.
+// This MUST be required before passport.initialize() is used at request time.
+require('./routes/auth');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -21,6 +26,9 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(compression());
 app.use(express.json());
+
+// ✅ NEW: Passport init (stateless, no sessions)
+app.use(passport.initialize());
 
 // Serve static files from the 'public' folder
 app.use(express.static(path.join(__dirname, 'public')));

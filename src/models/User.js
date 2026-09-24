@@ -6,9 +6,17 @@ const User = sequelize.define('User', {
     type: DataTypes.STRING,
     primaryKey: true,
   },
+  // ⚠️ allowNull true — Google-only users have no password.
+  // Existing password users keep working unchanged.
   password: {
     type: DataTypes.STRING,
-    allowNull: false,
+    allowNull: true,
+  },
+  // ✅ NEW: Google OAuth link
+  googleId: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    unique: true,
   },
   country: {
     type: DataTypes.STRING,
