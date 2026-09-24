@@ -1,16 +1,12 @@
 const { fetchJson, sleep, currencySymbol, round2, pct, isoOf } = require('../utils/helpers');
 const YahooFinance = require('yahoo-finance2').default;
 
-// ✅ v3: yahoo-finance2 exports a class now — instantiate once at module load.
-// suppressNotices silences the "v2 is unmaintained" nag on every call.
 const yahooFinance = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
 });
 
 const UA = process.env.YAHOO_FINANCE_UA || 'Mozilla/5.0 (compatible; DividendHub/2.0)';
 
-// ✅ FIX (CA): centralize market-aware defaults so Canada gets CAD/TSX
-// instead of silently falling back to USD/NASDAQ.
 function defaultCurrencyFor(market) {
   if (market === 'sg') return 'SGD';
   if (market === 'ca') return 'CAD';
@@ -31,7 +27,6 @@ async function fetchDividendsRaw(symbol, market) {
   if (chart.error) throw new Error(chart.error.description || 'source error');
   const result = chart.result?.[0];
   if (!result) return { currency: defaultCurrencyFor(market), dividends: [] };
-  // ✅ FIX (CA): use market-aware default rather than hardcoded USD
   const currency = result.meta?.currency || defaultCurrencyFor(market);
   const divs = result.events?.dividends || {};
   const out = [];
@@ -45,8 +40,6 @@ async function fetchDividendsRaw(symbol, market) {
 
 async function resolveName(symbol, market) {
   try {
-    // ✅ FIX (CA): strip any of .SI / .TO / .V before searching,
-    // not just .SI.
     const query = symbol.replace(/\.(SI|TO|V)$/, '');
     const results = await yahooSearch(query, market);
     const match = results.find(r => r.symbol === symbol);
@@ -73,7 +66,6 @@ async function fetchPricesRaw(symbol, startEpoch) {
 
 async function fetchEPSRaw(symbol) {
   try {
-    // ✅ v3: works identically — uses the instance instantiated at top of file
     const result = await yahooFinance.quoteSummary(symbol, {
       modules: ['defaultKeyStatistics', 'financialData'],
     });
@@ -102,8 +94,6 @@ async function fetchSplitsRaw(symbol) {
 }
 
 async function yahooSearch(q, market) {
-  // ✅ FIX (CA): map market → Yahoo region code, and add a CA branch
-  // that accepts TSX (.TO) and TSXV (.V) listings.
   const regionMap = { sg: 'SG', ca: 'CA', us: 'US' };
   const region = regionMap[market] || 'US';
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=24&newsCount=0&lang=en-US&region=${region}`;
@@ -119,7 +109,6 @@ async function yahooSearch(q, market) {
       ['EQUITY', 'MUTUALFUND', 'ETF', 'TRUST'].includes(x.quoteType)
     );
   } else if (market === 'ca') {
-    // ✅ NEW: TSX / TSXV listings only
     filtered = quotes.filter(x =>
       /\.(TO|V)$/i.test(String(x.symbol || '')) &&
       ['EQUITY', 'ETF', 'MUTUALFUND', 'TRUST'].includes(x.quoteType)
@@ -135,14 +124,118 @@ async function yahooSearch(q, market) {
     symbol: x.symbol,
     shortname: x.shortname || x.symbol,
     longname: x.longname || x.shortname || '',
-    // ✅ FIX (CA): market-aware exchange fallback
     exchange: x.exchange || defaultExchangeFor(market),
   }));
 }
 
 // ================================================================
-// ✅ Compute dividend metrics from a byYear array.
+// ✅ Special dividend detection (v2 — year-over-year comparison)
+//
+// The previous "2× median" approach over-flagged companies with
+// legitimately growing dividends. This version compares each trailing
+// payment to its closest prior-year equivalent:
+//
+//   - If the trailing payment is < 2× the prior-year amount → regular
+//   - If it's ≥ 2× → the EXCESS over baseline is flagged as special
+//
+// This correctly handles:
+//   - Real specials (SBS Transit: $0.08 → $0.41)
+//   - Regular dividend increases (a 20% raise doesn't trigger)
+//   - Variable payers with seasonal ups/downs
 // ================================================================
+function detectSpecialDividends(dividends) {
+  const empty = {
+    hasSpecial: false,
+    specialAmount: 0,
+    specialCount: 0,
+    specialDates: [],
+    regularAmount: 0,
+  };
+
+  if (!Array.isArray(dividends) || dividends.length < 6) return empty;
+
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  const oneYearAgo = nowEpoch - 365 * 86400;
+  const twoYearsAgo = nowEpoch - 730 * 86400;
+
+  const asc = [...dividends].sort((a, b) => a.epoch - b.epoch);
+  const trailing = asc.filter(d => d.epoch > oneYearAgo);
+  const prior = asc.filter(d => d.epoch > twoYearsAgo && d.epoch <= oneYearAgo);
+
+  if (trailing.length === 0) return empty;
+
+  // Not enough prior-year data — can't distinguish specials. Treat all as regular.
+  if (prior.length === 0) {
+    return {
+      hasSpecial: false,
+      specialAmount: 0,
+      specialCount: 0,
+      specialDates: [],
+      regularAmount: Math.round(trailing.reduce((s, d) => s + d.amount, 0) * 1e6) / 1e6,
+    };
+  }
+
+  const THRESHOLD_MULTIPLIER = 2.0;  // must be at least 2× prior-year to flag
+  const MATCH_WINDOW = 90 * 86400;   // match within ±90 days of one year earlier
+
+  const specials = [];
+  let regularAmount = 0;
+
+  for (const t of trailing) {
+    // Find the prior-year payment closest to exactly one year earlier
+    const targetEpoch = t.epoch - 365 * 86400;
+    let bestPrior = null;
+    let bestDist = Infinity;
+
+    for (const p of prior) {
+      const dist = Math.abs(p.epoch - targetEpoch);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPrior = p;
+      }
+    }
+
+    // No comparable prior payment found — treat as regular
+    if (!bestPrior || bestDist > MATCH_WINDOW) {
+      regularAmount += t.amount;
+      continue;
+    }
+
+    const baseline = bestPrior.amount;
+
+    if (t.amount > baseline * THRESHOLD_MULTIPLIER) {
+      // Flag the EXCESS as special. Baseline counts as the regular portion.
+      regularAmount += baseline;
+      specials.push({
+        epoch: t.epoch,
+        amount: t.amount - baseline,
+        fullAmount: t.amount,
+        baseline,
+      });
+    } else {
+      regularAmount += t.amount;
+    }
+  }
+
+  if (specials.length === 0) {
+    return {
+      hasSpecial: false,
+      specialAmount: 0,
+      specialCount: 0,
+      specialDates: [],
+      regularAmount: Math.round(regularAmount * 1e6) / 1e6,
+    };
+  }
+
+  return {
+    hasSpecial: true,
+    specialAmount: Math.round(specials.reduce((s, d) => s + d.amount, 0) * 1e6) / 1e6,
+    specialCount: specials.length,
+    specialDates: specials.map(d => isoOf(d.epoch)),
+    regularAmount: Math.round(regularAmount * 1e6) / 1e6,
+  };
+}
+
 function computeDividendMetrics(byYear) {
   const empty = { dividendCAGR: null, dividendFrequency: null, dividendStreak: 0, completeYears: [] };
   if (!Array.isArray(byYear) || byYear.length === 0) return empty;
@@ -157,7 +250,6 @@ function computeDividendMetrics(byYear) {
     .map(y => y.year)
     .filter(y => y < currentYear);
 
-  // ---------- 5-Year CAGR (complete years only) ----------
   let dividendCAGR = null;
   if (completeYears.length >= 2) {
     const latestComplete = completeYears[completeYears.length - 1];
@@ -181,7 +273,6 @@ function computeDividendMetrics(byYear) {
     }
   }
 
-  // ---------- Frequency: mode of last 3 complete years ----------
   let dividendFrequency = null;
   if (completeYears.length > 0) {
     const last3 = completeYears.slice(-3);
@@ -197,7 +288,6 @@ function computeDividendMetrics(byYear) {
     }
   }
 
-  // ---------- Streak: consecutive years of increase ----------
   let dividendStreak = 0;
   if (completeYears.length > 0) {
     dividendStreak = 1;
@@ -220,7 +310,6 @@ function computeDividendMetrics(byYear) {
 }
 
 async function fetchDividendData(symbol, market) {
-  // ✅ FIX (CA): single source of truth for market-aware defaults
   const defaultCcy = defaultCurrencyFor(market);
   const defaultExch = defaultExchangeFor(market);
 
@@ -240,6 +329,9 @@ async function fetchDividendData(symbol, market) {
         message: 'No dividend history found.',
         currentPrice: null,
         currentYield: null,
+        currentYieldWithSpecial: null,
+        hasSpecialDividend: false,
+        specialDividendAmount: 0,
         dividendCAGR: null,
         dividendFrequency: null,
         dividendStreak: 0,
@@ -272,7 +364,15 @@ async function fetchDividendData(symbol, market) {
 
     const metrics = computeDividendMetrics(byYear);
 
-    let currentPrice = null, currentYield = null, trailingAnnualDiv = 0;
+    // ✅ Special dividend detection (year-over-year)
+    const specials = detectSpecialDividends(dividends);
+
+    // Trailing amounts come directly from detectSpecialDividends()
+    const trailingRegular = specials.regularAmount;
+    const trailingSpecial = specials.specialAmount;
+
+    // Fetch price for yield math
+    let currentPrice = null;
     try {
       const priceData = await fetchPricesRaw(symbol, Math.floor(Date.now() / 1000) - 90 * 86400);
       const meta = priceData.meta || {};
@@ -283,15 +383,15 @@ async function fetchDividendData(symbol, market) {
           if (closes[i] != null) { currentPrice = closes[i]; break; }
         }
       }
-      if (currentPrice && currentPrice > 0) {
-        const now = Math.floor(Date.now() / 1000);
-        const oneYearAgo = now - 365 * 86400;
-        const recentDivs = dividends.filter(d => d.epoch > oneYearAgo);
-        trailingAnnualDiv = recentDivs.reduce((sum, d) => sum + d.amount, 0);
-        currentYield = (trailingAnnualDiv / currentPrice) * 100;
-        currentYield = Math.round(currentYield * 100) / 100;
-      }
     } catch (e) { /* skip */ }
+
+    const currentYield = (currentPrice && currentPrice > 0)
+      ? Math.round((trailingRegular / currentPrice) * 10000) / 100
+      : null;
+
+    const currentYieldWithSpecial = (currentPrice && currentPrice > 0)
+      ? Math.round(((trailingRegular + trailingSpecial) / currentPrice) * 10000) / 100
+      : null;
 
     // ---------- Safety score ----------
     let safetyScore = 'Caution';
@@ -326,8 +426,8 @@ async function fetchDividendData(symbol, market) {
       if (years.length > 5 && maxStreak > 3) score += 1;
       try {
         const eps = await fetchEPSRaw(symbol);
-        if (eps && eps > 0 && trailingAnnualDiv > 0) {
-          payoutRatio = (trailingAnnualDiv / eps) * 100;
+        if (eps && eps > 0 && trailingRegular > 0) {
+          payoutRatio = (trailingRegular / eps) * 100;
           if (payoutRatio < 70) score += 2;
           else if (payoutRatio < 90) score += 1;
           if (payoutRatio > 0 && payoutRatio < 100) score += 1;
@@ -350,11 +450,22 @@ async function fetchDividendData(symbol, market) {
       lastExDate: dates[dates.length - 1] || null,
       byYear,
       currentPrice: currentPrice ? round2(currentPrice) : null,
-      currentYield,
+
+      // Dual yield
+      currentYield,                 // regular only — this is what the DB stores
+      currentYieldWithSpecial,      // regular + special
+
+      // Special metadata
+      hasSpecialDividend: specials.hasSpecial,
+      specialDividendAmount: specials.specialAmount,
+      specialDividendCount: specials.specialCount,
+      specialDividendDates: specials.specialDates,
+
       dividendCAGR: metrics.dividendCAGR,
       dividendFrequency: metrics.dividendFrequency,
       dividendStreak: metrics.dividendStreak,
-      trailingAnnualDiv,
+      trailingAnnualDiv: Math.round(trailingRegular * 1e6) / 1e6,
+      trailingAnnualDivWithSpecial: Math.round((trailingRegular + trailingSpecial) * 1e6) / 1e6,
       payoutRatio: payoutRatio ? Math.round(payoutRatio * 100) / 100 : null,
       safetyScore,
       exchange: defaultExch,
@@ -373,6 +484,9 @@ async function fetchDividendData(symbol, market) {
       message: e.message || 'Failed to fetch dividend data',
       currentPrice: null,
       currentYield: null,
+      currentYieldWithSpecial: null,
+      hasSpecialDividend: false,
+      specialDividendAmount: 0,
       dividendCAGR: null,
       dividendFrequency: null,
       dividendStreak: 0,
@@ -392,4 +506,5 @@ module.exports = {
   resolveName,
   yahooSearch,
   computeDividendMetrics,
+  detectSpecialDividends,
 };

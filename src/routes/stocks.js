@@ -100,7 +100,6 @@ router.get('/search', limiter, async (req, res) => {
           symbol: item.symbol,
           shortname: item.shortname || item.symbol,
           longname: item.longname || item.shortname || item.symbol,
-          // ✅ FIX (CA): was hardcoding 'NASDAQ' for anything non-SG
           exchange: item.exchange || defaultExchangeFor(market),
         }));
       }
@@ -123,7 +122,6 @@ router.get('/search', limiter, async (req, res) => {
         symbol: s.symbol,
         shortname: s.name || s.symbol,
         longname: s.name || s.symbol,
-        // ✅ FIX (CA): was hardcoding 'NASDAQ' / 'SGX'
         exchange: defaultExchangeFor(market),
       }));
     } catch (e) {
@@ -193,8 +191,6 @@ router.get('/screener', limiter, async (req, res) => {
       return res.json(cached.data);
     }
 
-    // ✅ FIX (CA): 'both' now includes Canada. Before this, CA tickers were
-    // invisible on the default screener view (market defaults to 'both').
     const markets = market === 'both' ? ['us', 'sg', 'ca'] : [market];
     const allStocks = await Stock.findAll({ where: { market: markets } });
 
@@ -215,6 +211,13 @@ router.get('/screener', limiter, async (req, res) => {
       const currentPrice = parseFloat(s.currentPrice) || 0;
       const dividendCAGR = data.dividendCAGR != null ? Number(data.dividendCAGR) : null;
 
+      // ✅ NEW: dual yield + special dividend metadata
+      const hasSpecialDividend = !!data.hasSpecialDividend;
+      const currentYieldWithSpecial = data.currentYieldWithSpecial != null
+        ? Number(data.currentYieldWithSpecial)
+        : currentYield;
+      const specialDividendAmount = Number(data.specialDividendAmount) || 0;
+
       enriched.push({
         symbol: s.symbol,
         name: s.name || s.symbol,
@@ -224,7 +227,11 @@ router.get('/screener', limiter, async (req, res) => {
         frequencyOrder: FREQUENCY_ORDER[freq.label] ?? 99,
         paymentsPerYear: freq.paymentsPerYear,
         currentPrice,
+        // ✅ currentYield is now REGULAR only (from DB)
         currentYield,
+        currentYieldWithSpecial,
+        hasSpecialDividend,
+        specialDividendAmount,
         dividendCAGR,
         safetyScore: s.safetyScore || 'Caution',
         lastExDate: s.lastExDate,
@@ -254,8 +261,12 @@ router.get('/screener', limiter, async (req, res) => {
     // ---------- Sort ----------
     const safetyOrder = { Safe: 0, Moderate: 1, Caution: 2 };
     const sorters = {
+      // ✅ Both yield sorts use the REGULAR yield
       'yield-desc': (a, b) => b.currentYield - a.currentYield,
       'yield-asc': (a, b) => a.currentYield - b.currentYield,
+      // ✅ NEW: sorts for total yield
+      'yield-with-special-desc': (a, b) => b.currentYieldWithSpecial - a.currentYieldWithSpecial,
+      'yield-with-special-asc': (a, b) => a.currentYieldWithSpecial - b.currentYieldWithSpecial,
       'name-asc': (a, b) => a.name.localeCompare(b.name),
       'symbol-asc': (a, b) => a.symbol.localeCompare(b.symbol),
       'frequency-asc': (a, b) => a.frequencyOrder - b.frequencyOrder || b.currentYield - a.currentYield,
@@ -421,7 +432,6 @@ async function computeLongTermGrowth(symbol, market, amount) {
   }
 
   return {
-    // ✅ FIX (CA): C$ for Canadian stocks
     currencySymbol: defaultCurrencySymbolFor(market),
     labels, noDrip, drip,
     _needsRetry: noDrip[0] != null && noDrip[1] == null,
@@ -471,11 +481,9 @@ router.get('/long-term-growth', limiter, async (req, res) => {
 
 // ================================================================
 // UPCOMING EX-DIVIDEND CALENDAR
-// Estimates future ex-dates from each stock's historical payout pattern.
-// ⚠️  MUST be defined BEFORE the /:symbol catch-all route.
 // ================================================================
 const upcomingCache = new Map();
-const UPCOMING_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const UPCOMING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 function computeUpcomingExDates(byYear, maxDays = 60) {
   if (!Array.isArray(byYear) || byYear.length === 0) return [];
@@ -612,12 +620,15 @@ router.get('/:symbol', limiter, async (req, res) => {
     if (data.error || data.message) {
       return res.json({
         symbol: symbol.toUpperCase(),
-        // ✅ FIX (CA)
         currency: defaultCurrencyFor(market),
         currencySymbol: defaultCurrencySymbolFor(market),
         name: '', totalDividend: 0, payoutCount: 0, byYear: [],
         message: data.message || 'No data found',
-        currentPrice: null, currentYield: null, dividendCAGR: null,
+        currentPrice: null,
+        currentYield: null,
+        currentYieldWithSpecial: null,
+        hasSpecialDividend: false,
+        dividendCAGR: null,
         safetyScore: 'Caution',
         exchange: defaultExchangeFor(market),
       });
@@ -627,12 +638,15 @@ router.get('/:symbol', limiter, async (req, res) => {
     console.error('Stock detail error:', e);
     res.json({
       symbol: symbol.toUpperCase(),
-      // ✅ FIX (CA)
       currency: defaultCurrencyFor(market),
       currencySymbol: defaultCurrencySymbolFor(market),
       name: '', totalDividend: 0, payoutCount: 0, byYear: [],
       message: e.message || 'Failed to fetch stock data',
-      currentPrice: null, currentYield: null, dividendCAGR: null,
+      currentPrice: null,
+      currentYield: null,
+      currentYieldWithSpecial: null,
+      hasSpecialDividend: false,
+      dividendCAGR: null,
       safetyScore: 'Caution',
       exchange: defaultExchangeFor(market),
     });
@@ -666,18 +680,40 @@ router.get('/top/:market', limiter, async (req, res) => {
   try {
     const stocks = await Stock.findAll({
       where,
+      // ✅ Sort by the DB column 'currentYield' — this now stores the
+      // REGULAR-ONLY yield (specials excluded) from fetchDividendData.
       order: [['currentYield', 'DESC']],
       limit: 30,
     });
-    res.json(stocks.map(s => ({
-      symbol: s.symbol, name: s.name || s.symbol, type: s.type,
-      currentPrice: parseFloat(s.currentPrice) || 0,
-      currentYield: parseFloat(s.currentYield) || 0,
-      safetyScore: s.safetyScore || '—',
-      payoutCount: s.payoutCount || 0,
-      totalDividend: parseFloat(s.totalDividend) || 0,
-      lastExDate: s.lastExDate,
-    })));
+
+    res.json(stocks.map(s => {
+      const data = s.dividendData || {};
+      const regularYield = parseFloat(s.currentYield) || 0;
+      const totalYield = data.currentYieldWithSpecial != null
+        ? Number(data.currentYieldWithSpecial)
+        : regularYield;
+
+      return {
+        symbol: s.symbol,
+        name: s.name || s.symbol,
+        type: s.type,
+        currentPrice: parseFloat(s.currentPrice) || 0,
+
+        // ✅ Two yields
+        currentYield: regularYield,                       // regular only
+        currentYieldWithSpecial: totalYield,              // regular + special
+
+        // ✅ Special dividend metadata
+        hasSpecialDividend: !!data.hasSpecialDividend,
+        specialDividendAmount: Number(data.specialDividendAmount) || 0,
+        specialDividendCount: Number(data.specialDividendCount) || 0,
+
+        safetyScore: s.safetyScore || '—',
+        payoutCount: s.payoutCount || 0,
+        totalDividend: parseFloat(s.totalDividend) || 0,
+        lastExDate: s.lastExDate,
+      };
+    }));
   } catch (e) {
     console.error('Top stocks error:', e);
     res.json([]);

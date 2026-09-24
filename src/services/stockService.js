@@ -70,7 +70,20 @@ async function getStock(symbol, market, type = 'stock') {
       firstExDate: stock.firstExDate, lastExDate: stock.lastExDate,
       byYear: data.byYear || [],
       currentPrice: parseFloat(stock.currentPrice),
+
+      // ✅ Dual yield — regular only + with special
       currentYield: parseFloat(stock.currentYield),
+      currentYieldWithSpecial: data.currentYieldWithSpecial != null
+        ? Number(data.currentYieldWithSpecial)
+        : parseFloat(stock.currentYield),
+
+      // ✅ Special dividend metadata
+      hasSpecialDividend: !!data.hasSpecialDividend,
+      specialDividendAmount: Number(data.specialDividendAmount) || 0,
+      specialDividendCount: Number(data.specialDividendCount) || 0,
+      specialDividendDates: Array.isArray(data.specialDividendDates) ? data.specialDividendDates : [],
+      trailingAnnualDivWithSpecial: data.trailingAnnualDivWithSpecial || null,
+
       dividendCAGR: metrics.dividendCAGR,
       dividendFrequency: metrics.dividendFrequency,
       dividendStreak: metrics.dividendStreak,
@@ -98,6 +111,7 @@ async function getStock(symbol, market, type = 'stock') {
     lastUpdated: new Date(),
   });
 
+  // ✅ `data` already contains all new fields (returned by fetchDividendData)
   return data;
 }
 
@@ -118,7 +132,6 @@ async function getBatchStocks(symbols, market) {
 async function refreshTopStocks(market, options = {}) {
   const { onProgress } = options;
 
-  // ✅ FIX (CA): include 'ca' in the allowed target markets.
   const targetMarket = ['us', 'sg', 'ca'].includes(market) ? market : null;
 
   const lists = getSeedList();
@@ -137,7 +150,6 @@ async function refreshTopStocks(market, options = {}) {
       job.push({ symbol: sym, market: 'sg', type: isEtf ? 'etf' : 'stock' });
     }
   }
-  // ✅ NEW: Canada branch
   if (!targetMarket || targetMarket === 'ca') {
     for (const sym of lists.ca) {
       const isEtf = categoryMap[sym] === 'ETF' || categoryMap[sym] === 'Bond ETF';
