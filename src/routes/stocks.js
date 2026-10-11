@@ -683,7 +683,6 @@ router.get('/top/:market', limiter, async (req, res) => {
       // ✅ Sort by the DB column 'currentYield' — this now stores the
       // REGULAR-ONLY yield (specials excluded) from fetchDividendData.
       order: [['currentYield', 'DESC']],
-      limit: 100,
     });
 
     res.json(stocks.map(s => {
