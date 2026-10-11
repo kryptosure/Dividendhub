@@ -94,7 +94,7 @@ async function getStock(symbol, market, type = 'stock') {
     };
   }
 
-  const data = await fetchDividendData(cleanSymbol, market);
+  const data = await fetchDividendData(cleanSymbol, market, type);
   if (data.error || data.message) throw new Error(data.error || data.message);
 
   const freshPayoutRatio = await getCachedPayoutRatio(cleanSymbol);

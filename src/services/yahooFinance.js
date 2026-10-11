@@ -1,5 +1,6 @@
 const { fetchJson, sleep, currencySymbol, round2, pct, isoOf } = require('../utils/helpers');
 const YahooFinance = require('yahoo-finance2').default;
+const { classifyAssetType } = require('./stockClassifier');
 
 const yahooFinance = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -129,19 +130,120 @@ async function yahooSearch(q, market) {
 }
 
 // ================================================================
+// ✅ Safety score v2 — asset-type aware
+//
+// Previously every security used the same formula (dividend streak,
+// CV, payout ratio). That worked fine for stocks and REITs, but
+// broke for ETFs: covered-call ETFs have no dividend streak, variable
+// distributions, and no EPS → every ETF landed on Caution.
+//
+// New logic:
+//   • ETF / Bond ETF  → history length + distribution consistency +
+//                        issuer reputation + yield sanity
+//   • Preferred Stock → capped at Moderate (crypto-backed are risky)
+//   • Stock / REIT    → unchanged from v1
+// ================================================================
+
+function getIssuerScore(name) {
+  const n = String(name || '').toLowerCase();
+  // Tier 1: top-tier low-cost issuers → +2
+  if (/vanguard|ishares|blackrock|spdr|state street|schwab|invesco|jpmorgan/.test(n)) return 2;
+  // Tier 2: established mid-size issuers → +1
+  if (/fidelity|first trust|proshares|global x|wisdomtree|pacer|nuveen|janus|american century|franklin|abrdn|ssga/.test(n)) return 1;
+  // Tier 3: aggressive/thematic (YieldMax, Defiance, Roundhill, etc.) → +0
+  return 0;
+}
+
+function computeSafetyScore({ assetType, byYearMap, name, currentYield, payoutRatio }) {
+  const years = Object.keys(byYearMap || {}).map(Number).sort((a, b) => a - b);
+  const yearsCount = years.length;
+
+  // Max streak of consecutive years with dividends
+  let maxStreak = 0;
+  if (yearsCount > 0) {
+    let streak = 1;
+    maxStreak = 1;
+    for (let i = 1; i < yearsCount; i++) {
+      if (years[i] === years[i - 1] + 1) {
+        streak++;
+        if (streak > maxStreak) maxStreak = streak;
+      } else {
+        streak = 1;
+      }
+    }
+  }
+
+  // Coefficient of variation of annual totals
+  const divs = years.map(y => byYearMap[y].total);
+  const avg = divs.length ? divs.reduce((a, b) => a + b, 0) / divs.length : 0;
+  let cv = 99;
+  if (avg > 0) {
+    const variance = divs.reduce((a, b) => a + (b - avg) ** 2, 0) / divs.length;
+    cv = Math.sqrt(variance) / avg;
+  }
+
+  /* ---------- ETF / Bond ETF ---------- */
+  if (assetType === 'ETF' || assetType === 'Bond ETF') {
+    let score = 0;
+
+    // Distribution history
+    if (yearsCount >= 10) score += 2;
+    else if (yearsCount >= 5) score += 1;
+
+    // Distribution consistency
+    if (cv < 0.15) score += 2;
+    else if (cv < 0.30) score += 1;
+    else if (cv >= 0.50) score -= 1;
+
+    // Issuer reputation
+    score += getIssuerScore(name);
+
+    // Yield sanity (2–6% is normal for a dividend ETF)
+    const y = Number(currentYield) || 0;
+    if (y >= 2 && y <= 6) score += 1;
+    else if (y > 10) score -= 1;
+
+    // Bond ETFs get an inherent stability bonus
+    if (assetType === 'Bond ETF') score += 1;
+
+    if (score >= 6) return 'Safe';
+    if (score >= 3) return 'Moderate';
+    return 'Caution';
+  }
+
+  /* ---------- Preferred Stock ---------- */
+  if (assetType === 'Preferred Stock') {
+    // Crypto-backed preferreds (SATA, CHAD, STRC) — inherently risky.
+    // Cap at Moderate so they never show as "Safe."
+    let score = 0;
+    if (yearsCount >= 3) score += 1;
+    if (cv < 0.20) score += 1;
+    const y = Number(currentYield) || 0;
+    if (y > 0 && y <= 8) score += 1;
+    return score >= 3 ? 'Moderate' : 'Caution';
+  }
+
+  /* ---------- Stock / REIT (v1 formula, unchanged) ---------- */
+  let score = 0;
+  if (maxStreak > 10) score += 2;
+  else if (maxStreak > 5) score += 1;
+  if (yearsCount > 10) score += 1;
+  if (cv < 0.3) score += 1;
+  if (yearsCount > 5 && maxStreak > 3) score += 1;
+
+  if (payoutRatio != null && payoutRatio > 0) {
+    if (payoutRatio < 70) score += 2;
+    else if (payoutRatio < 90) score += 1;
+    if (payoutRatio < 100) score += 1;
+  }
+
+  if (score >= 5) return 'Safe';
+  if (score >= 3) return 'Moderate';
+  return 'Caution';
+}
+
+// ================================================================
 // ✅ Special dividend detection (v2 — year-over-year comparison)
-//
-// The previous "2× median" approach over-flagged companies with
-// legitimately growing dividends. This version compares each trailing
-// payment to its closest prior-year equivalent:
-//
-//   - If the trailing payment is < 2× the prior-year amount → regular
-//   - If it's ≥ 2× → the EXCESS over baseline is flagged as special
-//
-// This correctly handles:
-//   - Real specials (SBS Transit: $0.08 → $0.41)
-//   - Regular dividend increases (a 20% raise doesn't trigger)
-//   - Variable payers with seasonal ups/downs
 // ================================================================
 function detectSpecialDividends(dividends) {
   const empty = {
@@ -164,7 +266,6 @@ function detectSpecialDividends(dividends) {
 
   if (trailing.length === 0) return empty;
 
-  // Not enough prior-year data — can't distinguish specials. Treat all as regular.
   if (prior.length === 0) {
     return {
       hasSpecial: false,
@@ -175,14 +276,13 @@ function detectSpecialDividends(dividends) {
     };
   }
 
-  const THRESHOLD_MULTIPLIER = 2.0;  // must be at least 2× prior-year to flag
-  const MATCH_WINDOW = 90 * 86400;   // match within ±90 days of one year earlier
+  const THRESHOLD_MULTIPLIER = 2.0;
+  const MATCH_WINDOW = 90 * 86400;
 
   const specials = [];
   let regularAmount = 0;
 
   for (const t of trailing) {
-    // Find the prior-year payment closest to exactly one year earlier
     const targetEpoch = t.epoch - 365 * 86400;
     let bestPrior = null;
     let bestDist = Infinity;
@@ -195,7 +295,6 @@ function detectSpecialDividends(dividends) {
       }
     }
 
-    // No comparable prior payment found — treat as regular
     if (!bestPrior || bestDist > MATCH_WINDOW) {
       regularAmount += t.amount;
       continue;
@@ -204,7 +303,6 @@ function detectSpecialDividends(dividends) {
     const baseline = bestPrior.amount;
 
     if (t.amount > baseline * THRESHOLD_MULTIPLIER) {
-      // Flag the EXCESS as special. Baseline counts as the regular portion.
       regularAmount += baseline;
       specials.push({
         epoch: t.epoch,
@@ -309,7 +407,7 @@ function computeDividendMetrics(byYear) {
   return { dividendCAGR, dividendFrequency, dividendStreak, completeYears };
 }
 
-async function fetchDividendData(symbol, market) {
+async function fetchDividendData(symbol, market, typeField = null) {
   const defaultCcy = defaultCurrencyFor(market);
   const defaultExch = defaultExchangeFor(market);
 
@@ -363,15 +461,11 @@ async function fetchDividendData(symbol, market) {
     const name = await resolveName(symbol, market);
 
     const metrics = computeDividendMetrics(byYear);
-
-    // ✅ Special dividend detection (year-over-year)
     const specials = detectSpecialDividends(dividends);
 
-    // Trailing amounts come directly from detectSpecialDividends()
     const trailingRegular = specials.regularAmount;
     const trailingSpecial = specials.specialAmount;
 
-    // Fetch price for yield math
     let currentPrice = null;
     try {
       const priceData = await fetchPricesRaw(symbol, Math.floor(Date.now() / 1000) - 90 * 86400);
@@ -393,49 +487,27 @@ async function fetchDividendData(symbol, market) {
       ? Math.round(((trailingRegular + trailingSpecial) / currentPrice) * 10000) / 100
       : null;
 
-    // ---------- Safety score ----------
-    let safetyScore = 'Caution';
+    // ---------- Safety score (asset-type aware) ----------
+    const assetType = classifyAssetType(symbol, name, typeField);
+
     let payoutRatio = null;
-    try {
-      const years = Object.keys(byYearMap).map(Number).sort((a, b) => a - b);
-      let maxStreak = 1;
-      if (years.length > 0) {
-        let currentStreak = 1;
-        for (let i = 1; i < years.length; i++) {
-          if (years[i] === years[i - 1] + 1) {
-            currentStreak++;
-            maxStreak = Math.max(maxStreak, currentStreak);
-          } else {
-            currentStreak = 1;
-          }
-        }
-      }
-      const divs = years.map(y => byYearMap[y].total);
-      const avgDiv = divs.length ? divs.reduce((a, b) => a + b, 0) / divs.length : 0;
-      let cv = 99;
-      if (avgDiv > 0) {
-        const variance = divs.reduce((a, b) => a + (b - avgDiv) ** 2, 0) / divs.length;
-        const stdDev = Math.sqrt(variance);
-        cv = stdDev / avgDiv;
-      }
-      let score = 0;
-      if (maxStreak > 10) score += 2;
-      else if (maxStreak > 5) score += 1;
-      if (years.length > 10) score += 1;
-      if (cv < 0.3) score += 1;
-      if (years.length > 5 && maxStreak > 3) score += 1;
+    // Only fetch EPS for Stock / REIT / Preferred Stock — ETFs don't have useful EPS
+    if (assetType !== 'ETF' && assetType !== 'Bond ETF') {
       try {
         const eps = await fetchEPSRaw(symbol);
         if (eps && eps > 0 && trailingRegular > 0) {
           payoutRatio = (trailingRegular / eps) * 100;
-          if (payoutRatio < 70) score += 2;
-          else if (payoutRatio < 90) score += 1;
-          if (payoutRatio > 0 && payoutRatio < 100) score += 1;
         }
       } catch (e) { /* ignore */ }
-      if (score >= 5) safetyScore = 'Safe';
-      else if (score >= 3) safetyScore = 'Moderate';
-    } catch (e) { /* ignore */ }
+    }
+
+    const safetyScore = computeSafetyScore({
+      assetType,
+      byYearMap,
+      name,
+      currentYield,
+      payoutRatio,
+    });
 
     const ccy = currency || defaultCcy;
 
@@ -451,11 +523,9 @@ async function fetchDividendData(symbol, market) {
       byYear,
       currentPrice: currentPrice ? round2(currentPrice) : null,
 
-      // Dual yield
-      currentYield,                 // regular only — this is what the DB stores
-      currentYieldWithSpecial,      // regular + special
+      currentYield,
+      currentYieldWithSpecial,
 
-      // Special metadata
       hasSpecialDividend: specials.hasSpecial,
       specialDividendAmount: specials.specialAmount,
       specialDividendCount: specials.specialCount,
@@ -468,6 +538,7 @@ async function fetchDividendData(symbol, market) {
       trailingAnnualDivWithSpecial: Math.round((trailingRegular + trailingSpecial) * 1e6) / 1e6,
       payoutRatio: payoutRatio ? Math.round(payoutRatio * 100) / 100 : null,
       safetyScore,
+      assetType,
       exchange: defaultExch,
     };
   } catch (e) {
@@ -507,4 +578,6 @@ module.exports = {
   yahooSearch,
   computeDividendMetrics,
   detectSpecialDividends,
+  computeSafetyScore,
+  getIssuerScore,
 };
