@@ -94,6 +94,7 @@ async function getStock(symbol, market, type = 'stock') {
     };
   }
 
+  // ✅ Pass `type` through so the safety scorer can pick the right branch
   const data = await fetchDividendData(cleanSymbol, market, type);
   if (data.error || data.message) throw new Error(data.error || data.message);
 

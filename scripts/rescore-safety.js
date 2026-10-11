@@ -51,6 +51,7 @@ async function main() {
       assetType,
       byYearMap,
       name: s.name,
+      symbol: s.symbol,
       currentYield: parseFloat(s.currentYield) || 0,
       payoutRatio: data.payoutRatio ?? null,
     });
@@ -82,15 +83,9 @@ async function main() {
   if (changes.length === 0) {
     console.log('No changes needed. All ETF / Preferred scores are already correct.');
   } else {
-    // Group by direction
-    const up = changes.filter(c => {
-      const order = { Caution: 0, Moderate: 1, Safe: 2 };
-      return order[c.new] > order[c.old];
-    });
-    const down = changes.filter(c => {
-      const order = { Caution: 0, Moderate: 1, Safe: 2 };
-      return order[c.new] < order[c.old];
-    });
+    const order = { Caution: 0, Moderate: 1, Safe: 2 };
+    const up = changes.filter(c => order[c.new] > order[c.old]);
+    const down = changes.filter(c => order[c.new] < order[c.old]);
 
     if (up.length > 0) {
       console.log(`⬆️  UPGRADED (${up.length}):`);

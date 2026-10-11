@@ -131,30 +131,43 @@ async function yahooSearch(q, market) {
 
 // ================================================================
 // ✅ Safety score v2 — asset-type aware
-//
-// Previously every security used the same formula (dividend streak,
-// CV, payout ratio). That worked fine for stocks and REITs, but
-// broke for ETFs: covered-call ETFs have no dividend streak, variable
-// distributions, and no EPS → every ETF landed on Caution.
-//
-// New logic:
-//   • ETF / Bond ETF  → history length + distribution consistency +
-//                        issuer reputation + yield sanity
-//   • Preferred Stock → capped at Moderate (crypto-backed are risky)
-//   • Stock / REIT    → unchanged from v1
 // ================================================================
 
-function getIssuerScore(name) {
+// Blue-chip ETF tickers — auto-treated as Tier 1 even if the DB
+// only has the ticker as the name (e.g. SPY, IVV).
+const TIER_1_ETF_TICKERS = new Set([
+  // Broad market index
+  'SPY', 'IVV', 'VOO', 'VTI', 'ITOT', 'SCHB', 'SCHX', 'SPTM',
+  // Nasdaq / growth
+  'QQQ', 'QQQM', 'VGT', 'VONG', 'SCHG', 'IWF', 'VUG',
+  // Value / dividend
+  'SCHD', 'VYM', 'VIG', 'DGRO', 'SDY', 'DVY', 'HDV', 'SPHD', 'SPYD', 'NOBL', 'FDVV',
+  // International
+  'VXUS', 'VEA', 'VWO', 'IEFA', 'IEMG', 'ACWI', 'VEU', 'SCHF', 'SCHE',
+  // Small cap
+  'IWM', 'IJH', 'IJR', 'VB', 'VBR', 'SCHA', 'SCHM',
+  // Bond
+  'BND', 'AGG', 'BNDX', 'VCIT', 'VCSH', 'VGIT', 'VGLT', 'BSV', 'BIV', 'BLV',
+  'GOVT', 'SHY', 'TLT', 'IEF', 'LQD', 'HYG', 'JNK', 'TIP', 'VTIP', 'MUB',
+  'SHV', 'BIL', 'SGOV', 'JPST', 'ICSH', 'MINT', 'NEAR', 'FLOT', 'USIG', 'IGIB',
+  // Sector SPDR
+  'XLK', 'XLF', 'XLE', 'XLI', 'XLV', 'XLY', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC',
+]);
+
+const TIER_1_ISSUER_NAMES = /vanguard|ishares|blackrock|spdr|state street|schwab|invesco|jpmorgan|fidelity|ssga|bny mellon/i;
+const TIER_2_ISSUER_NAMES = /first trust|proshares|global x|wisdomtree|pacer|nuveen|janus|american century|franklin|abrdn|flexshares|john hancock|eaton vance/i;
+
+function getIssuerScore(name, symbol) {
+  const ticker = String(symbol || '').toUpperCase().trim();
+  if (TIER_1_ETF_TICKERS.has(ticker)) return 2;
+
   const n = String(name || '').toLowerCase();
-  // Tier 1: top-tier low-cost issuers → +2
-  if (/vanguard|ishares|blackrock|spdr|state street|schwab|invesco|jpmorgan/.test(n)) return 2;
-  // Tier 2: established mid-size issuers → +1
-  if (/fidelity|first trust|proshares|global x|wisdomtree|pacer|nuveen|janus|american century|franklin|abrdn|ssga/.test(n)) return 1;
-  // Tier 3: aggressive/thematic (YieldMax, Defiance, Roundhill, etc.) → +0
+  if (TIER_1_ISSUER_NAMES.test(n)) return 2;
+  if (TIER_2_ISSUER_NAMES.test(n)) return 1;
   return 0;
 }
 
-function computeSafetyScore({ assetType, byYearMap, name, currentYield, payoutRatio }) {
+function computeSafetyScore({ assetType, byYearMap, name, symbol, currentYield, payoutRatio }) {
   const years = Object.keys(byYearMap || {}).map(Number).sort((a, b) => a - b);
   const yearsCount = years.length;
 
@@ -173,15 +186,6 @@ function computeSafetyScore({ assetType, byYearMap, name, currentYield, payoutRa
     }
   }
 
-  // Coefficient of variation of annual totals
-  const divs = years.map(y => byYearMap[y].total);
-  const avg = divs.length ? divs.reduce((a, b) => a + b, 0) / divs.length : 0;
-  let cv = 99;
-  if (avg > 0) {
-    const variance = divs.reduce((a, b) => a + (b - avg) ** 2, 0) / divs.length;
-    cv = Math.sqrt(variance) / avg;
-  }
-
   /* ---------- ETF / Bond ETF ---------- */
   if (assetType === 'ETF' || assetType === 'Bond ETF') {
     let score = 0;
@@ -190,17 +194,28 @@ function computeSafetyScore({ assetType, byYearMap, name, currentYield, payoutRa
     if (yearsCount >= 10) score += 2;
     else if (yearsCount >= 5) score += 1;
 
-    // Distribution consistency
-    if (cv < 0.15) score += 2;
-    else if (cv < 0.30) score += 1;
-    else if (cv >= 0.50) score -= 1;
+    // ✅ Distribution consistency — computed over the LAST 10 YEARS only,
+    // not the full history. Using full history inflates the CV for old
+    // funds (SPY, IVV, VOO) whose dividend grew 5–7x since inception.
+    const recentYears = years.slice(-10);
+    const recentDivs = recentYears.map(y => byYearMap[y].total);
+    const avg = recentDivs.length ? recentDivs.reduce((a, b) => a + b, 0) / recentDivs.length : 0;
+    let cv = 99;
+    if (avg > 0) {
+      const variance = recentDivs.reduce((a, b) => a + (b - avg) ** 2, 0) / recentDivs.length;
+      cv = Math.sqrt(variance) / avg;
+    }
+
+    if (cv < 0.20) score += 2;
+    else if (cv < 0.35) score += 1;
+    else if (cv >= 0.55) score -= 1;
 
     // Issuer reputation
-    score += getIssuerScore(name);
+    score += getIssuerScore(name, symbol);
 
-    // Yield sanity (2–6% is normal for a dividend ETF)
+    // Yield sanity — most dividend ETFs pay 0.5–6%
     const y = Number(currentYield) || 0;
-    if (y >= 2 && y <= 6) score += 1;
+    if (y >= 0.5 && y <= 6) score += 1;
     else if (y > 10) score -= 1;
 
     // Bond ETFs get an inherent stability bonus
@@ -213,21 +228,38 @@ function computeSafetyScore({ assetType, byYearMap, name, currentYield, payoutRa
 
   /* ---------- Preferred Stock ---------- */
   if (assetType === 'Preferred Stock') {
-    // Crypto-backed preferreds (SATA, CHAD, STRC) — inherently risky.
-    // Cap at Moderate so they never show as "Safe."
     let score = 0;
     if (yearsCount >= 3) score += 1;
+    const recentYears = years.slice(-5);
+    const recentDivs = recentYears.map(y => byYearMap[y].total);
+    const avg = recentDivs.length ? recentDivs.reduce((a, b) => a + b, 0) / recentDivs.length : 0;
+    let cv = 99;
+    if (avg > 0) {
+      const variance = recentDivs.reduce((a, b) => a + (b - avg) ** 2, 0) / recentDivs.length;
+      cv = Math.sqrt(variance) / avg;
+    }
     if (cv < 0.20) score += 1;
     const y = Number(currentYield) || 0;
     if (y > 0 && y <= 8) score += 1;
     return score >= 3 ? 'Moderate' : 'Caution';
   }
 
-  /* ---------- Stock / REIT (v1 formula, unchanged) ---------- */
+  /* ---------- Stock / REIT (v1 formula) ---------- */
   let score = 0;
   if (maxStreak > 10) score += 2;
   else if (maxStreak > 5) score += 1;
   if (yearsCount > 10) score += 1;
+
+  // CV over last 10 years (same rationale as ETFs)
+  const recentYears = years.slice(-10);
+  const recentDivs = recentYears.map(y => byYearMap[y].total);
+  const avg = recentDivs.length ? recentDivs.reduce((a, b) => a + b, 0) / recentDivs.length : 0;
+  let cv = 99;
+  if (avg > 0) {
+    const variance = recentDivs.reduce((a, b) => a + (b - avg) ** 2, 0) / recentDivs.length;
+    cv = Math.sqrt(variance) / avg;
+  }
+
   if (cv < 0.3) score += 1;
   if (yearsCount > 5 && maxStreak > 3) score += 1;
 
@@ -491,7 +523,6 @@ async function fetchDividendData(symbol, market, typeField = null) {
     const assetType = classifyAssetType(symbol, name, typeField);
 
     let payoutRatio = null;
-    // Only fetch EPS for Stock / REIT / Preferred Stock — ETFs don't have useful EPS
     if (assetType !== 'ETF' && assetType !== 'Bond ETF') {
       try {
         const eps = await fetchEPSRaw(symbol);
@@ -505,6 +536,7 @@ async function fetchDividendData(symbol, market, typeField = null) {
       assetType,
       byYearMap,
       name,
+      symbol,
       currentYield,
       payoutRatio,
     });
