@@ -71,13 +71,13 @@ async function getStock(symbol, market, type = 'stock') {
       byYear: data.byYear || [],
       currentPrice: parseFloat(stock.currentPrice),
 
-      // ✅ Dual yield — regular only + with special
+      // Dual yield: regular only + with special
       currentYield: parseFloat(stock.currentYield),
       currentYieldWithSpecial: data.currentYieldWithSpecial != null
         ? Number(data.currentYieldWithSpecial)
         : parseFloat(stock.currentYield),
 
-      // ✅ Special dividend metadata
+      // Special dividend metadata
       hasSpecialDividend: !!data.hasSpecialDividend,
       specialDividendAmount: Number(data.specialDividendAmount) || 0,
       specialDividendCount: Number(data.specialDividendCount) || 0,
@@ -94,25 +94,54 @@ async function getStock(symbol, market, type = 'stock') {
     };
   }
 
-  // ✅ Pass `type` through so the safety scorer can pick the right branch
+  // Pass `type` through so the safety scorer can pick the right branch
   const data = await fetchDividendData(cleanSymbol, market, type);
   if (data.error || data.message) throw new Error(data.error || data.message);
 
   const freshPayoutRatio = await getCachedPayoutRatio(cleanSymbol);
   data.payoutRatio = freshPayoutRatio;
 
-  await Stock.upsert({
-    symbol: data.symbol || cleanSymbol,
-    name: data.name, market: market, type: type,
-    dividendData: data,
-    currentPrice: data.currentPrice, currentYield: data.currentYield,
-    safetyScore: data.safetyScore, payoutCount: data.payoutCount,
-    totalDividend: data.totalDividend,
-    firstExDate: data.firstExDate, lastExDate: data.lastExDate,
-    lastUpdated: new Date(),
-  });
+  // FIX: never let an update overwrite the market column.
+  // Previously, Stock.upsert overwrote every column on conflict, which
+  // meant a Canadian ticker fetched under market='us' would get its
+  // market flipped permanently. Now market is set on CREATE only.
+  const stockSymbol = data.symbol || cleanSymbol;
+  const existing = await Stock.findByPk(stockSymbol);
 
-  // ✅ `data` already contains all new fields (returned by fetchDividendData)
+  if (existing) {
+    await existing.update({
+      name: data.name,
+      type: type,
+      dividendData: data,
+      currentPrice: data.currentPrice,
+      currentYield: data.currentYield,
+      safetyScore: data.safetyScore,
+      payoutCount: data.payoutCount,
+      totalDividend: data.totalDividend,
+      firstExDate: data.firstExDate,
+      lastExDate: data.lastExDate,
+      lastUpdated: new Date(),
+      // market intentionally NOT updated
+    });
+  } else {
+    await Stock.create({
+      symbol: stockSymbol,
+      name: data.name,
+      market: market,
+      type: type,
+      dividendData: data,
+      currentPrice: data.currentPrice,
+      currentYield: data.currentYield,
+      safetyScore: data.safetyScore,
+      payoutCount: data.payoutCount,
+      totalDividend: data.totalDividend,
+      firstExDate: data.firstExDate,
+      lastExDate: data.lastExDate,
+      lastUpdated: new Date(),
+    });
+  }
+
+  // `data` already contains all new fields (returned by fetchDividendData)
   return data;
 }
 

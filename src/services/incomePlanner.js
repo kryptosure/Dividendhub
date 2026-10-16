@@ -6,6 +6,15 @@
 
 const Stock = require('../models/stock');
 
+// ---------- Symbol to market (source of truth) ----------
+// Never trust the DB market column for cross-listed tickers.
+function symbolMarket(symbol) {
+  const s = String(symbol || '').toUpperCase();
+  if (s.endsWith('.SI')) return 'sg';
+  if (s.endsWith('.TO') || s.endsWith('.V')) return 'ca';
+  return 'us';
+}
+
 // ---------- Sector map (fallback when Yahoo doesn't provide one) ----------
 // Canada entries use the FULL symbol as key because base tickers collide with
 // US ones (e.g. PPL.TO = Pembina Energy vs PPL = PPL Corp Utilities).
@@ -13,28 +22,40 @@ const SECTOR_MAP = {
   // Consumer Staples
   KO: 'Consumer Staples', PEP: 'Consumer Staples', MO: 'Consumer Staples',
   KHC: 'Consumer Staples', PG: 'Consumer Staples', WMT: 'Consumer Staples',
+  CAG: 'Consumer Staples', GIS: 'Consumer Staples', K: 'Consumer Staples',
+  HSY: 'Consumer Staples', KMB: 'Consumer Staples', CL: 'Consumer Staples',
+  KR: 'Consumer Staples', COST: 'Consumer Staples', SYY: 'Consumer Staples',
   F34: 'Consumer Staples',
   // Healthcare
   JNJ: 'Healthcare', PFE: 'Healthcare', ABBV: 'Healthcare', MRK: 'Healthcare',
+  UNH: 'Healthcare', BMY: 'Healthcare', LLY: 'Healthcare', AMGN: 'Healthcare',
   // Communication Services
   VZ: 'Communication Services', T: 'Communication Services', Z74: 'Communication Services',
-  // Financials
+  TMUS: 'Communication Services', CMCSA: 'Communication Services',
+  // Financials (banks + BDCs + asset managers)
   JPM: 'Financials', BAC: 'Financials', WFC: 'Financials', C: 'Financials',
-  GS: 'Financials', MS: 'Financials',
+  GS: 'Financials', MS: 'Financials', BLK: 'Financials', SCHW: 'Financials',
+  MAIN: 'Financials', CSWC: 'Financials', ARCC: 'Financials', ORCC: 'Financials',
+  PSEC: 'Financials', HTGC: 'Financials', GBDC: 'Financials', TSLX: 'Financials',
   D05: 'Financials', O39: 'Financials', U11: 'Financials', S68: 'Financials',
   // Energy
   XOM: 'Energy', CVX: 'Energy', KMI: 'Energy', ET: 'Energy',
+  WMB: 'Energy', OKE: 'Energy', PSX: 'Energy', VLO: 'Energy',
   // Utilities
-  NEE: 'Utilities', DUK: 'Utilities',
+  NEE: 'Utilities', DUK: 'Utilities', SO: 'Utilities', D: 'Utilities',
+  AEP: 'Utilities', EXC: 'Utilities',
   // Technology
   IBM: 'Technology', MSFT: 'Technology', AAPL: 'Technology', NVDA: 'Technology',
+  CSCO: 'Technology', TXN: 'Technology', INTC: 'Technology', AVGO: 'Technology',
   // Consumer Discretionary
   MCD: 'Consumer Discretionary', HD: 'Consumer Discretionary', F: 'Consumer Discretionary',
+  LOW: 'Consumer Discretionary', TGT: 'Consumer Discretionary',
   // Industrials
   ZIM: 'Industrials', C6L: 'Industrials', BN4: 'Industrials', S63: 'Industrials',
-  C52: 'Industrials',
+  C52: 'Industrials', UPS: 'Industrials', CAT: 'Industrials', MMM: 'Industrials',
   // Real Estate (REITs + property)
-  MPW: 'Real Estate', VICI: 'Real Estate',
+  MPW: 'Real Estate', VICI: 'Real Estate', O: 'Real Estate', SPG: 'Real Estate',
+  NNN: 'Real Estate', UHT: 'Real Estate', WPC: 'Real Estate', STAG: 'Real Estate',
   K71U: 'Real Estate', A17U: 'Real Estate', N2IU: 'Real Estate',
   C38U: 'Real Estate', M44U: 'Real Estate', H78: 'Real Estate',
   J36: 'Real Estate', T82U: 'Real Estate', AJBU: 'Real Estate',
@@ -81,9 +102,18 @@ function getSector(symbol, name) {
   if (SECTOR_MAP[clean]) return SECTOR_MAP[clean];
 
   const n = String(name || '').toLowerCase();
-  if (n.includes('reit')) return 'Real Estate';
+
+  // REIT detection now catches "Realty" and "Real Estate" in addition
+  // to "REIT". This fixes UHT (Universal Health Realty Income Trust)
+  // being misclassified as Index Fund.
+  if (n.includes('reit') || n.includes('realty') || n.includes('real estate')) return 'Real Estate';
+
   if (n.includes('bond') || n.includes('treasury') || n.includes('aggregate')) return 'Fixed Income';
-  if (n.includes(' etf') || n.includes('trust')) return 'Index Fund';
+
+  // Only treat as Index Fund if the name clearly says so.
+  // "Trust" alone is too broad (catches REITs and closed-end funds).
+  if (n.includes(' etf') || n.includes('index fund') || n.includes('index etf')) return 'Index Fund';
+
   return 'Other';
 }
 
@@ -116,7 +146,7 @@ function isBondEtf(symbol, name) {
 function isReit(symbol, name, sector) {
   if (sector === 'Real Estate') return true;
   const n = String(name || '').toLowerCase();
-  if (n.includes('reit')) return true;
+  if (n.includes('reit') || n.includes('realty') || n.includes('real estate')) return true;
   return false;
 }
 
@@ -260,6 +290,12 @@ async function generateAllocation({
     const price = parseFloat(s.currentPrice) || 0;
     const sector = getSector(s.symbol, s.name);
 
+    // HARD GUARD: derive market from symbol suffix, not the DB column.
+    // Prevents cross-listed tickers (e.g. ENB.TO) from appearing in the
+    // wrong location if their market column was ever corrupted.
+    const symMarket = symbolMarket(s.symbol);
+    if (!markets.includes(symMarket)) continue;
+
     if (isBondEtf(s.symbol, s.name)) continue;
     if (sector === 'Fixed Income') continue;
 
@@ -279,13 +315,13 @@ async function generateAllocation({
     if (cagr != null && cagr < -10) continue;
     if (streak < profile.minStreak) continue;
 
-    // CA: currency fallback now handles CAD
-    const fallbackCcy = s.market === 'sg' ? 'SGD' : s.market === 'ca' ? 'CAD' : 'USD';
+    // Currency fallback derived from the symbol, not the DB market
+    const fallbackCcy = symMarket === 'sg' ? 'SGD' : symMarket === 'ca' ? 'CAD' : 'USD';
 
     candidates.push({
       symbol: s.symbol,
       name: s.name || s.symbol,
-      market: s.market,
+      market: symMarket,
       sector,
       isReit: reit,
       safety,
@@ -305,7 +341,7 @@ async function generateAllocation({
     };
   }
 
-  // FIX: fixed yield reference instead of maxYield.
+  // Fixed yield reference instead of maxYield.
   // Previously, a single 30% outlier compressed every other stock's
   // yield score. Now, anything at or above the profile's top-of-range
   // yield scores 1.0, and everything below scales proportionally.
@@ -342,8 +378,8 @@ async function generateAllocation({
   for (const c of candidates) {
     if (selected.length >= targetN) break;
 
-    // FIX: cap Caution names so a couple of yield traps cannot
-    // drag the average yield into double digits.
+    // Cap Caution names so a couple of yield traps cannot drag the
+    // average yield into double digits.
     if (c.safety === 'Caution' && cautionCount >= maxCaution) continue;
 
     const sc = sectorCounts[c.sector] || 0;
