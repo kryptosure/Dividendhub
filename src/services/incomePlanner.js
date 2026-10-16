@@ -41,7 +41,7 @@ const SECTOR_MAP = {
   // Singapore ETFs that are index funds (not REITs)
   ES3: 'Index Fund', G3B: 'Index Fund',
 
-  // ✅ CANADA — full-symbol keys to avoid US collisions
+  // CANADA - full-symbol keys to avoid US collisions
   'RY.TO': 'Financials',
   'TD.TO': 'Financials',
   'BNS.TO': 'Financials',
@@ -121,6 +121,13 @@ function isReit(symbol, name, sector) {
 }
 
 // ---------- Risk profiles ----------
+//
+// maxYield        hard ceiling on any candidate's yield (percent).
+//                 Anything above is almost always a yield trap, a
+//                 mortgage REIT in distress, or a data glitch.
+// maxCautionCount how many Caution-rated names can appear in the
+//                 final portfolio (high-income only).
+//
 const RISK_PROFILES = {
   conservative: {
     key: 'conservative',
@@ -133,6 +140,8 @@ const RISK_PROFILES = {
     maxPositionPct: 10,
     maxSectorPct: 25,
     targetCount: 15,
+    maxYield: 7,
+    maxCautionCount: 0,
     weights: { yield: 0.30, safety: 0.50, growth: 0.20 },
     expectedYieldRange: [2.5, 4.5],
   },
@@ -147,6 +156,8 @@ const RISK_PROFILES = {
     maxPositionPct: 12,
     maxSectorPct: 30,
     targetCount: 12,
+    maxYield: 9,
+    maxCautionCount: 0,
     weights: { yield: 0.40, safety: 0.35, growth: 0.25 },
     expectedYieldRange: [3.5, 6.0],
   },
@@ -161,6 +172,8 @@ const RISK_PROFILES = {
     maxPositionPct: 12,
     maxSectorPct: 35,
     targetCount: 12,
+    maxYield: 7,
+    maxCautionCount: 0,
     weights: { yield: 0.25, safety: 0.30, growth: 0.45 },
     expectedYieldRange: [2.5, 5.0],
   },
@@ -171,16 +184,18 @@ const RISK_PROFILES = {
     description: 'Higher income now, but riskier stocks.',
     allowedSafety: ['Safe', 'Moderate', 'Caution'],
     minStreak: 3,
-    maxPayoutRatio: 110,
+    maxPayoutRatio: 100,
     maxPositionPct: 8,
     maxSectorPct: 35,
     targetCount: 12,
+    maxYield: 12,
+    maxCautionCount: 3,
     weights: { yield: 0.70, safety: 0.20, growth: 0.10 },
     expectedYieldRange: [5.0, 8.0],
   },
 };
 
-// ✅ CA added. 'All' replaces 'Both' as the mixed-markets option.
+// CA added. 'All' replaces 'Both' as the mixed-markets option.
 // 'Both' is kept for backward compatibility.
 const LOCATION_MARKETS = {
   SG: ['sg'],
@@ -251,6 +266,9 @@ async function generateAllocation({
     if (yieldPct <= 0) continue;
     if (price <= 0) continue;
 
+    // HARD CAP: exclude yield traps and data glitches
+    if (yieldPct > profile.maxYield) continue;
+
     if (!profile.allowedSafety.includes(safety)) continue;
 
     const reit = isReit(s.symbol, s.name, sector);
@@ -261,7 +279,7 @@ async function generateAllocation({
     if (cagr != null && cagr < -10) continue;
     if (streak < profile.minStreak) continue;
 
-    // ✅ CA: currency fallback now handles CAD
+    // CA: currency fallback now handles CAD
     const fallbackCcy = s.market === 'sg' ? 'SGD' : s.market === 'ca' ? 'CAD' : 'USD';
 
     candidates.push({
@@ -287,10 +305,14 @@ async function generateAllocation({
     };
   }
 
-  const maxYield = Math.max(...candidates.map(c => c.currentYield), 0.01);
+  // FIX: fixed yield reference instead of maxYield.
+  // Previously, a single 30% outlier compressed every other stock's
+  // yield score. Now, anything at or above the profile's top-of-range
+  // yield scores 1.0, and everything below scales proportionally.
+  const yieldReference = Math.max(profile.expectedYieldRange[1], 1);
 
   for (const c of candidates) {
-    const yieldScore = Math.min(c.currentYield / maxYield, 1);
+    const yieldScore = Math.min(c.currentYield / yieldReference, 1);
     const safetyScoreVal = SAFETY_MULT[c.safety] || 0.4;
     const growthScore = Math.min(Math.max(c.dividendCAGR, 0) / 10, 1);
 
@@ -314,13 +336,22 @@ async function generateAllocation({
   const selected = [];
   const sectorCounts = {};
   const maxPerSector = Math.max(2, Math.floor(targetN * 0.3));
+  const maxCaution = profile.maxCautionCount != null ? profile.maxCautionCount : 99;
+  let cautionCount = 0;
 
   for (const c of candidates) {
     if (selected.length >= targetN) break;
+
+    // FIX: cap Caution names so a couple of yield traps cannot
+    // drag the average yield into double digits.
+    if (c.safety === 'Caution' && cautionCount >= maxCaution) continue;
+
     const sc = sectorCounts[c.sector] || 0;
     if (sc >= maxPerSector) continue;
+
     selected.push(c);
     sectorCounts[c.sector] = sc + 1;
+    if (c.safety === 'Caution') cautionCount++;
   }
 
   if (selected.length < Math.min(8, targetN)) {
@@ -328,8 +359,11 @@ async function generateAllocation({
     for (const c of candidates) {
       if (selected.length >= Math.min(8, targetN)) break;
       if (picked.has(c.symbol)) continue;
+      // Still respect the Caution cap on the backfill
+      if (c.safety === 'Caution' && cautionCount >= maxCaution) continue;
       selected.push(c);
       picked.add(c.symbol);
+      if (c.safety === 'Caution') cautionCount++;
     }
   }
 
@@ -422,7 +456,7 @@ async function generateAllocation({
 
   const warnings = [];
   if (capital > 0 && totalMonthlyIncome < targetMonthly * 0.9) {
-    warnings.push(`Your ${capital.toLocaleString()} would generate about $${totalMonthlyIncome.toFixed(2)}/month — below your goal of $${targetMonthly.toLocaleString()}.`);
+    warnings.push(`Your ${capital.toLocaleString()} would generate about $${totalMonthlyIncome.toFixed(2)}/month, below your goal of $${targetMonthly.toLocaleString()}.`);
   }
   if (leftoverCash > 50) {
     warnings.push(`About $${leftoverCash.toFixed(2)} couldn't be allocated because some share prices are too high for the remaining amount.`);
