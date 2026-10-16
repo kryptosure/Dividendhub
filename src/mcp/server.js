@@ -1,7 +1,7 @@
 // backend/src/mcp/server.js
 const z = require('zod/v4');
 
-const API_BASE = process.env.API_BASE_URL || 'https://dividendhub-api.onrender.com';
+const API_BASE = process.env.API_BASE_URL || 'https://api.dividendbro.com';
 
 /**
  * Factory that creates a fresh MCP server instance.
