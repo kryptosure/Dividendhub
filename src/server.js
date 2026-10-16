@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
 const path = require('path');
-const passport = require('passport');              // ✅ NEW
+const passport = require('passport');
 const sequelize = require('./config/database');
 require('./jobs/refreshStocks');
 
@@ -12,14 +12,13 @@ const Stock = require('./models/stock');
 const { Op } = require('sequelize');
 const { yahooSearch } = require('./services/yahooFinance');
 
-// ✅ NEW: Registering the Google strategy as a side effect of requiring auth routes.
-// This MUST be required before passport.initialize() is used at request time.
+// ✅ Register Google strategy before passport.initialize()
 require('./routes/auth');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ✅ Trust Render's reverse proxy so express-rate-limit sees real client IPs
+// Trust Render's reverse proxy
 app.set('trust proxy', 1);
 
 // Middleware
@@ -27,11 +26,25 @@ app.use(cors());
 app.use(compression());
 app.use(express.json());
 
-// ✅ NEW: Passport init (stateless, no sessions)
+// ✅ Passport init (stateless, no sessions)
 app.use(passport.initialize());
 
-// Serve static files from the 'public' folder
+// Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ---------- MCP endpoint for AI agents ----------
+// Mounted early so it never conflicts with API routes.
+// Handler lazily initializes the MCP SDK on first request.
+app.all('/mcp', async (req, res) => {
+  try {
+    const { getNodeHandler } = require('./mcp/handler');
+    const handler = await getNodeHandler();
+    return handler(req, res, req.body);
+  } catch (err) {
+    console.error('MCP handler error:', err);
+    res.status(500).json({ error: 'MCP handler failed', message: err.message });
+  }
+});
 
 // ---------- Existing routes ----------
 app.use('/api/stocks-list', require('./routes/stocksList'));
@@ -46,10 +59,7 @@ app.use('/api/chat', require('./routes/chat'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/events', require('./routes/events'));
 
-// ✅ NEW: Income Planner routes
 app.use('/api/income-planner', require('./routes/incomePlanner'));
-
-// ✅ NEW: AI subsite streaming chat (ai.dividendbro.com)
 app.use('/api/ai', require('./routes/ai'));
 
 // ---------- /api/search endpoint ----------
@@ -172,5 +182,6 @@ sequelize.sync({ alter: true }).then(() => {
     console.log(`🚀 DividendHub backend running on port ${PORT}`);
     console.log(`📦 Compression: enabled`);
     console.log(`🗄️  Serving static files from: ${path.join(__dirname, 'public')}`);
+    console.log(`🤖 MCP endpoint: /mcp`);
   });
 });
